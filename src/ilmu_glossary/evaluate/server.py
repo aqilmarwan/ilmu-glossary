@@ -83,24 +83,45 @@ def _clamp_to_model_capacity(model_path: str, requested: int, cfg: Config) -> in
     return capacity
 
 
-def _wait_for_health(base_url: str, *, timeout_s: int = 1800, interval_s: float = 5.0) -> None:
+def _wait_for_health(
+    base_url: str,
+    *,
+    timeout_s: int = 1800,
+    interval_s: float = 5.0,
+    process: subprocess.Popen[bytes] | None = None,
+) -> None:
     """Block until the server answers /health.
 
     A 30B hybrid Mamba model with a long context takes minutes to load, and
-    NVFP4 kernel autotuning adds more, so the default timeout is generous.
+    NVFP4 kernel autotuning adds more, so the timeout is generous. It is only
+    a backstop though: if vLLM exits, waiting the full 30 minutes for a
+    process that is already dead burns half an hour of B200 time for nothing,
+    so the subprocess is polled every interval and its exit is fatal
+    immediately.
     """
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
+    waited = 0.0
 
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"vLLM exited with code {process.returncode} before becoming "
+                f"healthy, after {waited:.0f}s. Its traceback is above."
+            )
         try:
             with urllib.request.urlopen(f"{base_url}/health", timeout=10) as response:
                 if response.status == 200:
-                    logger.info("vLLM healthy at %s", base_url)
+                    logger.info("vLLM healthy at %s after %.0fs", base_url, waited)
                     return
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             last_error = exc
         time.sleep(interval_s)
+        waited += interval_s
+        # Startup is long and quiet; say something so a stalled load is
+        # distinguishable from a slow one.
+        if waited % 60 == 0:
+            logger.info("waiting for vLLM (%.0fs elapsed)", waited)
 
     raise TimeoutError(f"vLLM did not become healthy within {timeout_s}s: {last_error!r}")
 
@@ -146,11 +167,13 @@ def serve(
         args.append("--trust-remote-code")
 
     logger.info("Starting vLLM: %s", " ".join(args))
-    env = {**os.environ, "VLLM_LOGGING_LEVEL": "WARNING"}
+    # INFO, not WARNING: startup is the part that fails, and suppressing it
+    # makes a crashed load indistinguishable from a slow one in the logs.
+    env = {**os.environ, "VLLM_LOGGING_LEVEL": "INFO"}
     process = subprocess.Popen(args, env=env)
 
     try:
-        _wait_for_health(base_url)
+        _wait_for_health(base_url, process=process)
         yield ServerHandle(base_url, model_path, mamba_state, process)
     finally:
         logger.info("Stopping vLLM (pid %s)", process.pid)
