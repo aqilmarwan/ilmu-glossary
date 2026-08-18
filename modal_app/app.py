@@ -188,6 +188,42 @@ def phase3_quantize(
 
 
 # --------------------------------------------------------------------------
+# Phase 3+4 combined - quantize and measure tier 1 without exporting
+# --------------------------------------------------------------------------
+#
+# ModelOpt cannot export Nemotron's fused MoE experts and save_pretrained
+# fails on its 0-dim amax tensors, so a quantized Nemotron checkpoint cannot
+# be persisted or served. The primary metric does not need one: this captures
+# BF16 logits, quantizes in place, captures again, and computes the BM-EN KL
+# delta before the model leaves memory.
+
+
+@app.function(
+    image=ptq_image,
+    gpu="B200",
+    volumes=VOLUMES,
+    secrets=SECRETS,
+    timeout=6 * HOURS,
+)
+def phase3_quantize_and_eval(
+    config_yaml: str | None = None,
+    dry_run: bool = False,
+    variant: str = "baseline_en",
+    sample_count: int = 1024,
+    family: str = "w4a16_shipped",
+) -> dict[str, Any]:
+    """One PTQ cell plus its tier-1 measurement, in a single container."""
+    from ilmu_glossary.quantize_and_eval import run_quantize_and_evaluate
+
+    cfg = _load_config(config_yaml, dry_run)
+    result = run_quantize_and_evaluate(
+        cfg, variant=variant, sample_count=sample_count, family=family
+    )
+    volume.commit()
+    return result
+
+
+# --------------------------------------------------------------------------
 # Phase 4 - evaluation (GPU, serves each checkpoint on vLLM)
 # --------------------------------------------------------------------------
 
