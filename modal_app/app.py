@@ -49,6 +49,23 @@ SECRETS = [modal.Secret.from_name("huggingface-secret")]
 HOURS = 60 * 60
 
 
+def _csv(value: str | None) -> list[str] | None:
+    """Parse a comma-separated CLI argument into a list.
+
+    Modal function signatures double as the `modal run` CLI surface, and its
+    parser rejects `list[str] | None` ("unparseable annotation"). Scalars in,
+    lists parsed here.
+    """
+    if value is None or not value.strip():
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _csv_int(value: str | None) -> list[int] | None:
+    parsed = _csv(value)
+    return [int(item) for item in parsed] if parsed else None
+
+
 def _load_config(config_yaml: str | None, dry_run: bool) -> Any:
     """Rebuild the Config inside the container.
 
@@ -130,13 +147,14 @@ def phase1_routing(config_yaml: str | None = None, dry_run: bool = False) -> dic
 def phase2_calib_select(
     config_yaml: str | None = None,
     dry_run: bool = False,
-    variants: list[str] | None = None,
-    sample_counts: list[int] | None = None,
+    variants: str | None = None,
+    sample_counts: str | None = None,
 ) -> dict[str, Any]:
+    """`variants` and `sample_counts` are comma-separated, e.g. "256,1024"."""
     from ilmu_glossary.calib_select import run_phase2
 
     cfg = _load_config(config_yaml, dry_run)
-    result = run_phase2(cfg, variants=variants, sample_counts=sample_counts)
+    result = run_phase2(cfg, variants=_csv(variants), sample_counts=_csv_int(sample_counts))
     volume.commit()
     return result
 
@@ -185,12 +203,13 @@ def phase4_evaluate(
     config_yaml: str | None = None,
     dry_run: bool = False,
     checkpoint: str = "bf16_reference",
-    tiers: list[str] | None = None,
+    tiers: str | None = None,
 ) -> dict[str, Any]:
+    """`tiers` is comma-separated, e.g. "kl,ppl". Omit to run all of them."""
     from ilmu_glossary.evaluate import run_phase4
 
     cfg = _load_config(config_yaml, dry_run)
-    result = run_phase4(cfg, checkpoint=checkpoint, tiers=tiers)
+    result = run_phase4(cfg, checkpoint=checkpoint, tiers=_csv(tiers))
     volume.commit()
     return result
 

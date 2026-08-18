@@ -97,9 +97,11 @@ def staged_pipeline(
     # The headroom comparison needs both arms, so both are built before the gate.
     gate_pair = [gate_variant.value, baseline.value]
 
+    # Modal function args are the CLI surface, so lists cross the boundary
+    # as comma-separated strings (see modal_app.app._csv).
     record(
         "phase2_gate",
-        _call(phase2, **common, variants=gate_pair, sample_counts=[gate_n]),
+        _call(phase2, **common, variants=",".join(gate_pair), sample_counts=str(gate_n)),
     )
 
     # The gate runs on the shipped family. It is the configuration people
@@ -182,7 +184,7 @@ def staged_pipeline(
                 continue  # already measured; it is the serving default
             record(
                 f"phase4_{winner}_{arm.value}",
-                _call(phase4, **common, checkpoint=winner, tiers=["throughput", "kl"]),
+                _call(phase4, **common, checkpoint=winner, tiers="throughput,kl"),
             )
 
     # ------------------------------------------------------------ phase 5
