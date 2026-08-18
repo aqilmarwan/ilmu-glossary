@@ -671,11 +671,35 @@ def run_phase0(cfg: Config) -> dict[str, Any]:
         for class_key, specs in cfg.data.sources.items():
             if class_key == PARALLEL_CLASS:
                 continue
+            # The class this source is configured to feed. Streaming stops when
+            # *it* is full rather than when every class is - the bulk corpus is
+            # listed under three classes but can never fill english_control or
+            # code_control, so an all-classes condition would consume all
+            # 349 GB before moving to the next source.
+            primary = _corpus_class_or_none(class_key)
+            cap = cfg.data.max_records_per_source if not cfg.dry_run else 20_000
+
             for spec in specs:
                 manifest = IngestManifest(source=spec.repo_id)
                 try:
                     for record in stream_source(spec):
                         manifest.records_read += 1
+
+                        if primary is not None and len(buffers[primary]) >= target:
+                            manifest.records_rejected["primary_class_full"] += 1
+                            break
+                        if manifest.records_read > cap:
+                            logger.warning(
+                                "%s: hit the %d-record cap for %s with %d documents "
+                                "kept. Raise data.max_records_per_source if the "
+                                "class is under quota.",
+                                spec.repo_id,
+                                cap,
+                                class_key,
+                                len(buffers[primary]) if primary else 0,
+                            )
+                            manifest.records_rejected["source_cap_reached"] += 1
+                            break
                         if _all_classes_full(buffers, target, cfg):
                             break
 
@@ -812,6 +836,15 @@ def run_phase0(cfg: Config) -> dict[str, Any]:
         )
 
     return summary
+
+
+def _corpus_class_or_none(class_key: str) -> CorpusClass | None:
+    """Map a config source key to its CorpusClass, or None if unrecognised."""
+    try:
+        return CorpusClass(class_key)
+    except ValueError:
+        logger.warning("Source key %r is not a corpus class; no per-source cap", class_key)
+        return None
 
 
 def _all_classes_full(

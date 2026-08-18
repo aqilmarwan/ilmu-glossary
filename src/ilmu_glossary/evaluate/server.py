@@ -95,6 +95,9 @@ def serve(
         model_path,
         mamba_state=mamba_state,
         max_model_len=max_model_len or cfg.model.eval_max_model_len,
+        # The dry-run proxy is a plain transformer MoE; Mamba/Nemotron flags
+        # would make vLLM refuse to start.
+        hybrid_mamba=not cfg.dry_run,
     )
     if cfg.model.trust_remote_code:
         args.append("--trust-remote-code")

@@ -60,6 +60,9 @@ cpu_image = (
     .pip_install("fasttext-wheel>=0.9.2")
     .env(_ENV)
     .add_local_python_source("ilmu_glossary")
+    # Phase 3 reads recipes/*.yaml at run time; the python-source mount does
+    # not carry them, and a missing recipe fails hours into a run.
+    .add_local_dir("recipes", remote_path="/root/recipes")
 )
 
 
@@ -93,6 +96,7 @@ gpu_image = (
         }
     )
     .add_local_python_source("ilmu_glossary")
+    .add_local_dir("recipes", remote_path="/root/recipes")
 )
 
 

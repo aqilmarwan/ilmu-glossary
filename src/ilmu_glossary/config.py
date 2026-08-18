@@ -160,8 +160,15 @@ class VllmConfig(BaseModel):
         *,
         mamba_state: MambaStateDtype,
         max_model_len: int,
+        hybrid_mamba: bool = True,
     ) -> list[str]:
-        """Build the `vllm serve` argv. Single source of truth for serving."""
+        """Build the `vllm serve` argv. Single source of truth for serving.
+
+        `hybrid_mamba=False` drops every Nemotron- and Mamba-specific flag.
+        The dry-run proxy is an ordinary transformer MoE with no SSM layers,
+        and vLLM refuses to start when handed `--mamba-backend` or
+        `--reasoning-parser nemotron_v3` for a model that has neither.
+        """
         args = [
             "vllm",
             "serve",
@@ -174,6 +181,18 @@ class VllmConfig(BaseModel):
             str(max_model_len),
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self.port),
+        ]
+        if self.enable_prefix_caching:
+            args.append("--enable-prefix-caching")
+
+        if not hybrid_mamba:
+            return args
+
+        args += [
             "--mamba-backend",
             self.mamba_backend,
             "--moe-backend",
@@ -186,13 +205,7 @@ class VllmConfig(BaseModel):
             self.mamba_cache_mode,
             "--reasoning-parser",
             self.reasoning_parser,
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(self.port),
         ]
-        if self.enable_prefix_caching:
-            args.append("--enable-prefix-caching")
         if self.async_scheduling:
             args.append("--async-scheduling")
 
@@ -248,6 +261,10 @@ class DataConfig(BaseModel):
     # Documents shorter than this contribute little to a 32K calibration
     # sample and distort the fertility statistic.
     min_doc_chars: int = 200
+    # Hard bound on records consumed from any single upstream source. The bulk
+    # Malaysian corpus is effectively unbounded when streamed, so without this
+    # phase 0 never reaches its later sources.
+    max_records_per_source: int = 400_000
 
     sources: dict[str, list[SourceSpec]] = Field(default_factory=dict)
 

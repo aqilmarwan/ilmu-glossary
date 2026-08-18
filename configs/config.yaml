@@ -36,6 +36,7 @@ data:
   dedup_ngram: 13
   dedup_threshold: 0.8
   min_doc_chars: 200
+  max_records_per_source: 400000
 
   sources:
     formal_bm:
