@@ -49,6 +49,7 @@ class Artifacts:
     calibration_coverage: pd.DataFrame | None = None
     quantization_runs: pd.DataFrame | None = None
     kl: pd.DataFrame | None = None
+    kl_per_class: pd.DataFrame | None = None
     ppl: pd.DataFrame | None = None
     cross_mmlu: pd.DataFrame | None = None
     malay_mmlu: pd.DataFrame | None = None
@@ -96,6 +97,7 @@ def load_artifacts(cfg: Config) -> Artifacts:
         quantization_runs=_try_read(results / "quantization_runs.parquet"),
         per_document_profiles=_try_read(routing / "per_document_profiles.parquet"),
         kl=_concat_eval(eval_dir, "kl"),
+        kl_per_class=_concat_eval(eval_dir, "kl_per_class"),
         ppl=_concat_eval(eval_dir, "ppl"),
         cross_mmlu=_concat_eval(eval_dir, "cross_mmlu"),
         malay_mmlu=_concat_eval(eval_dir, "malay_mmlu"),
@@ -484,9 +486,26 @@ def build_report(cfg: Config, artifacts: Artifacts) -> str:
     add(_markdown_table(_kl_summary(artifacts.kl)))
     add(_contamination_note(artifacts.kl))
 
+    add("\n### Per-class KL, classes unmerged\n")
+    add(
+        "Spec section 4a: formal BM, Manglish and code-switched text are "
+        "expected to differ, and merging them hides the most interesting "
+        "result. These classes differ in domain as well as language, so a "
+        "difference here is confounded - it carries magnitude and the shape "
+        "across registers, not the causal claim.\n\n"
+    )
+    add(_markdown_table(_per_class_kl_summary(artifacts.kl_per_class)))
+    add(_contamination_note(artifacts.kl_per_class))
+
     # -------------------------------------------------------------- item 6
     add("## 6. Perplexity delta per corpus class, per variant\n")
     add(_markdown_table(artifacts.ppl))
+    if artifacts.ppl is not None and "ppl_delta" not in artifacts.ppl.columns:
+        add(
+            "\n> Absolute perplexity only - no BF16 reference was available to "
+            "difference against. Spec section 4b asks for the delta; evaluate "
+            "`bf16_reference` first.\n"
+        )
     add(
         "\nClasses are **not merged**. Formal BM, Manglish and code-switched "
         "text are expected to differ, and merging them would hide the most "
@@ -516,6 +535,7 @@ def build_report(cfg: Config, artifacts: Artifacts) -> str:
     # -------------------------------------------------------------- item 8
     add("## 8. Throughput confirmation\n")
     add(_markdown_table(artifacts.throughput))
+    add(_throughput_verdict(artifacts.throughput))
     add(
         "\nRecalibration changes scale values, not kernels, so throughput "
         "should be flat. A flagged regression means something other than "
@@ -672,6 +692,30 @@ def _kl_summary(kl: pd.DataFrame | None) -> pd.DataFrame | None:
     return kl[columns]
 
 
+def _per_class_kl_summary(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return df
+    columns = [
+        c
+        for c in (
+            "checkpoint",
+            "variant",
+            "contaminated",
+            "corpus_class",
+            "n_documents",
+            "n_tokens",
+            "kl_mean",
+            "kl_p50",
+            "kl_p99",
+            "kl_ci_low",
+            "kl_ci_high",
+            "mean_tail_mass",
+        )
+        if c in df.columns
+    ]
+    return df[columns].sort_values(["checkpoint", "kl_mean"], ascending=[True, False])
+
+
 def _accuracy_summary(df: pd.DataFrame | None, keys: list[str]) -> pd.DataFrame | None:
     if df is None or df.empty:
         return df
@@ -679,6 +723,26 @@ def _accuracy_summary(df: pd.DataFrame | None, keys: list[str]) -> pd.DataFrame 
 
     present = [k for k in keys if k in df.columns]
     return accuracy_summary(df, group_by=present or None)
+
+
+def _throughput_verdict(df: pd.DataFrame | None) -> str:
+    """State whether tier 4e actually confirmed anything."""
+    if df is None or df.empty:
+        return ""
+    if "regression_flagged" not in df.columns:
+        return (
+            "\n> Not compared against the BF16 reference, so this tier confirms "
+            "nothing yet - it is a table of absolute throughput. Evaluate "
+            "`bf16_reference` first.\n"
+        )
+    flagged = df[df["regression_flagged"].fillna(False).astype(bool)]
+    if flagged.empty:
+        return "\n**Confirmed: no material throughput change.**\n"
+    rows = ", ".join(
+        f"{r['checkpoint']}@c={r['concurrency']} ({100 * float(r['throughput_vs_reference']):+.1f}%)"
+        for _, r in flagged.iterrows()
+    )
+    return f"\n> **Throughput regression flagged:** {rows}.\n"
 
 
 def _mamba_arm(throughput: pd.DataFrame | None) -> pd.DataFrame | None:

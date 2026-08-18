@@ -35,7 +35,7 @@ from ilmu_glossary.evaluate import throughput as tp_mod
 from ilmu_glossary.evaluate.server import ServerHandle, serve
 from ilmu_glossary.io import read_jsonl, write_json, write_parquet
 from ilmu_glossary.seeds import seed_everything
-from ilmu_glossary.splits import load_splits
+from ilmu_glossary.splits import Split, assert_disjoint, load_splits, verify_all
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,45 @@ def resolve_checkpoint_path(cfg: Config, checkpoint: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"No quantized checkpoint at {path}; run phase 3")
     return str(path)
+
+
+def assert_evaluation_is_clean(cfg: Config, checkpoint: str, splits: dict[str, Split]) -> None:
+    """Assert the calibration set behind this checkpoint never touched evaluation.
+
+    Spec section 9 lists calibration/eval contamination as a named risk and
+    asks for disjointness to be asserted per phase. Phases 0 and 2 did;
+    phase 4 only logged that splits existed, so a contaminated checkpoint
+    would have been evaluated without complaint and its numbers reported as
+    legitimate.
+
+    `oracle_contaminated` is contaminated by construction and must say so
+    rather than skip the check.
+    """
+    variant = _variant_of(checkpoint)
+    if variant is None:
+        logger.info("%s carries no calibration variant; nothing to check", checkpoint)
+        return
+
+    eval_ids = {f"{name}:{i}" for name, split in splits.items() for i in split.eval_indices}
+
+    calibration_ids: set[str] = set()
+    for path in sorted(cfg.paths.resolve("calibration_sets").glob(f"{variant.value}_*.jsonl")):
+        calibration_ids.update(str(record["id"]) for record in read_jsonl(path) if "id" in record)
+
+    if not calibration_ids:
+        logger.warning(
+            "No calibration set found for %s; disjointness cannot be asserted "
+            "and must not be assumed.",
+            variant.value,
+        )
+        return
+
+    assert_disjoint(
+        calibration_ids,
+        eval_ids,
+        context=f"phase4/{checkpoint}",
+        allow_contamination=variant.is_contaminated,
+    )
 
 
 def _variant_of(checkpoint: str) -> CalibVariant | None:
@@ -232,6 +271,100 @@ def run_tier1_kl(
     return pd.DataFrame([row]), cache
 
 
+def run_per_class_kl(
+    cfg: Config,
+    handle: ServerHandle,
+    reference_cache: dict[str, kl_mod.TopKLogprobs] | None,
+    *,
+    checkpoint: str,
+) -> tuple[pd.DataFrame, dict[str, kl_mod.TopKLogprobs]]:
+    """Per-corpus-class KL, deliberately unmerged.
+
+    Spec section 4a: "Also compute per-class KL across the six corpus classes
+    for the magnitude picture. **Do not merge classes** - formal BM, Manglish,
+    and code-switched text will likely differ, and merging hides the most
+    interesting result."
+
+    This is separate from the parallel-pair metric on purpose. These classes
+    differ in domain as well as language, so a difference between them is
+    confounded and cannot carry the causal claim - it carries magnitude, and
+    the shape across registers.
+
+    Documents are drawn from the held-out 20% only.
+    """
+    from ilmu_glossary.splits import load_splits
+
+    splits = load_splits(cfg.paths.resolve("splits"))
+    stratified = cfg.paths.resolve("stratified")
+    is_reference = reference_cache is None
+    cache: dict[str, kl_mod.TopKLogprobs] = {}
+    rows: list[dict[str, Any]] = []
+
+    limit = 16 if cfg.dry_run else cfg.eval.ppl_max_docs_per_class
+
+    for corpus_class, split in sorted(splits.items()):
+        if corpus_class == "parallel_bm_en":
+            continue
+        path = stratified / f"{corpus_class}.jsonl"
+        if not path.exists():
+            continue
+
+        eval_indices = set(split.eval_indices)
+        values: list[float] = []
+        tails: list[float] = []
+        n_docs = 0
+
+        for i, record in enumerate(read_jsonl(path)):
+            if i not in eval_indices or n_docs >= limit:
+                continue
+            text = record.get("text") or record.get("malay") or ""
+            if not text.strip():
+                continue
+            n_docs += 1
+            key = f"class::{corpus_class}::{i}"
+            captured = _capture_topk(
+                handle, text, cfg.eval.kl_top_k, cfg.eval.kl_max_tokens_per_side
+            )
+            if is_reference:
+                cache[key] = captured
+                continue
+            reference = reference_cache.get(key) if reference_cache else None
+            if reference is None:
+                continue
+            per_token, per_tail = kl_mod.token_kl(reference, captured)
+            values.extend(per_token.tolist())
+            tails.extend(per_tail.tolist())
+
+        if is_reference or not values:
+            continue
+
+        summary = kl_mod.summarise_kl(
+            np.array(values),
+            np.array(tails),
+            percentiles=cfg.eval.kl_percentiles,
+            bootstrap_resamples=cfg.eval.bootstrap_resamples,
+            confidence_level=cfg.eval.confidence_level,
+            seed=cfg.seed,
+        )
+        variant = _variant_of(checkpoint)
+        rows.append(
+            {
+                "checkpoint": checkpoint,
+                "variant": variant.value if variant else "",
+                "contaminated": bool(variant and variant.is_contaminated),
+                "corpus_class": corpus_class,
+                "n_documents": n_docs,
+                **summary,
+            }
+        )
+
+    if is_reference:
+        logger.info("Captured reference logprobs for %d held-out documents", len(cache))
+        return pd.DataFrame(), cache
+
+    return kl_mod.per_class_table(rows), cache
+
+
 # --------------------------------------------------------------------------
 # phase driver
 # --------------------------------------------------------------------------
@@ -250,13 +383,14 @@ def run_phase4(
     eval_dir = cfg.paths.resolve("eval")
     wanted = tiers or list(TIERS)
 
-    # Spec section 3: assert disjointness before each phase. Evaluation must
-    # touch only the held-out 20%.
+    # Spec sections 3 and 4b: assert disjointness before each phase, not just
+    # log that splits exist. This previously only counted them.
     splits = load_splits(cfg.paths.resolve("splits"))
-    logger.info("Split guard: %d classes with persisted indices", len(splits))
+    verify_all(splits, expected_fraction=cfg.data.train_fraction)
+    variant = _variant_of(checkpoint)
+    assert_evaluation_is_clean(cfg, checkpoint, splits)
 
     model_path = resolve_checkpoint_path(cfg, checkpoint)
-    variant = _variant_of(checkpoint)
     summary: dict[str, Any] = {"checkpoint": checkpoint, "model_path": model_path, "tiers": {}}
 
     with (
@@ -286,8 +420,21 @@ def run_phase4(
                     )
 
             table, cache = run_tier1_kl(cfg, handle, reference_cache, checkpoint=checkpoint)
-            if cache:
-                _save_reference_cache(cache_path, cache)
+
+            # Spec section 4a's second half: per-class KL, classes unmerged.
+            class_table, class_cache = run_per_class_kl(
+                cfg, handle, reference_cache, checkpoint=checkpoint
+            )
+            if cache or class_cache:
+                _save_reference_cache(cache_path, {**cache, **class_cache})
+            if not class_table.empty:
+                write_parquet(
+                    class_table,
+                    eval_dir / f"{checkpoint}_kl_per_class.parquet",
+                    fingerprint=fingerprint,
+                    phase="phase4",
+                )
+                summary["tiers"]["kl_per_class"] = class_table.to_dict(orient="records")
             if not table.empty:
                 write_parquet(
                     table,
@@ -313,7 +460,20 @@ def run_phase4(
                 texts = ppl_mod.load_held_out(cfg, corpus_class)
                 nlls = ppl_mod.score_texts(handle, texts, stride=cfg.eval.ppl_stride)
                 results[corpus_class] = ppl_mod.perplexity_from_nlls(nlls, corpus_class, len(texts))
-            table = pd.DataFrame([r.to_row() for r in results.values()])
+            # Spec section 4b asks for absolute PPL *and* delta versus BF16.
+            reference = _reference_perplexities(cfg) if checkpoint != REFERENCE_CHECKPOINT else {}
+            table = (
+                ppl_mod.delta_table(results, reference)
+                if reference
+                else pd.DataFrame([r.to_row() for r in results.values()])
+            )
+            if not reference and checkpoint != REFERENCE_CHECKPOINT:
+                logger.warning(
+                    "No BF16 reference perplexities found; reporting absolute PPL "
+                    "only. The delta is what spec section 4b asks for - evaluate "
+                    "%s first.",
+                    REFERENCE_CHECKPOINT,
+                )
             table["checkpoint"] = checkpoint
             write_parquet(
                 table,
@@ -363,6 +523,10 @@ def run_phase4(
         # --------------------------------------------------------- tier 4e
         if "throughput" in wanted:
             table = tp_mod.benchmark_checkpoint(cfg, handle, checkpoint)
+            # Spec section 4e exists to confirm recalibration costs no
+            # throughput. Writing raw tok/s without comparing to the reference
+            # cannot confirm anything.
+            table = _with_throughput_regression(cfg, table, checkpoint)
             write_parquet(
                 table,
                 eval_dir / f"{checkpoint}_throughput.parquet",
@@ -373,6 +537,49 @@ def run_phase4(
 
     write_json(summary, eval_dir / f"{checkpoint}_summary.json")
     return summary
+
+
+def _reference_perplexities(cfg: Config) -> dict[str, ppl_mod.PerplexityResult]:
+    """Load the BF16 reference perplexities so a delta can be computed."""
+    path = cfg.paths.resolve("eval") / f"{REFERENCE_CHECKPOINT}_ppl.parquet"
+    if not path.exists():
+        return {}
+    frame = pd.read_parquet(path)
+    return {
+        str(row["corpus_class"]): ppl_mod.PerplexityResult(
+            corpus_class=str(row["corpus_class"]),
+            perplexity=float(row["perplexity"]),
+            mean_nll=float(row["mean_nll"]),
+            nll_std=float(row.get("nll_std", 0.0)),
+            n_documents=int(row.get("n_documents", 0)),
+            n_tokens=int(row.get("n_tokens", 0)),
+        )
+        for _, row in frame.iterrows()
+    }
+
+
+def _with_throughput_regression(cfg: Config, table: pd.DataFrame, checkpoint: str) -> pd.DataFrame:
+    """Append the BF16 reference rows and flag any material throughput move."""
+    reference_path = cfg.paths.resolve("eval") / f"{REFERENCE_CHECKPOINT}_throughput.parquet"
+    if checkpoint == REFERENCE_CHECKPOINT or not reference_path.exists():
+        return table
+
+    reference = pd.read_parquet(reference_path)
+    combined = pd.concat([reference, table], ignore_index=True)
+    checked = tp_mod.regression_check(combined, reference_checkpoint=REFERENCE_CHECKPOINT)
+    flagged = checked[
+        (checked["checkpoint"] == checkpoint) & checked.get("regression_flagged", False)
+    ]
+    if not flagged.empty:
+        logger.warning(
+            "%s throughput moved materially from the BF16 reference at "
+            "concurrency %s. Recalibration changes scale values, not kernels, "
+            "so something else changed and the accuracy result for this "
+            "checkpoint needs explaining before it is trusted.",
+            checkpoint,
+            flagged["concurrency"].tolist(),
+        )
+    return checked[checked["checkpoint"] == checkpoint].reset_index(drop=True)
 
 
 def _save_reference_cache(path: Path, cache: dict[str, kl_mod.TopKLogprobs]) -> None:
@@ -407,7 +614,9 @@ def _load_reference_cache(path: Path) -> dict[str, kl_mod.TopKLogprobs] | None:
 __all__ = [
     "REFERENCE_CHECKPOINT",
     "TIERS",
+    "assert_evaluation_is_clean",
     "resolve_checkpoint_path",
+    "run_per_class_kl",
     "run_phase4",
     "run_tier1_kl",
     "stable_token_id",

@@ -21,6 +21,7 @@ Two families run (see SPEC_DEVIATIONS.md D2):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -66,6 +67,25 @@ class Recipe:
     @property
     def algorithm(self) -> str:
         return str(self.payload.get("quantization", {}).get("algorithm", "unknown"))
+
+    @property
+    def exclude_patterns(self) -> tuple[str, ...]:
+        """Modules the recipe says must stay in full precision.
+
+        Routers are the load-bearing entry: quantizing one changes which
+        experts fire, so the routing distribution would move at the same time
+        as the expert numerics and no observed difference could be attributed
+        to either.
+        """
+        excluded = self.payload.get("quantization", {}).get("exclude", []) or []
+        return tuple(str(p) for p in excluded)
+
+    @property
+    def router_patterns(self) -> tuple[str, ...]:
+        """The subset of exclusions that name routers."""
+        return tuple(
+            p for p in self.exclude_patterns if "gate" in p.lower() or "router" in p.lower()
+        )
 
     @property
     def expert_activation_bits(self) -> int | None:
@@ -257,6 +277,7 @@ class QuantizationRun:
     n_quantized_modules: int = 0
     expert_carriers: int = 0
     experts_quantized: int = 0
+    exclusion_violations: int = 0
     export_method: str = ""
     fallback_layers: list[str] = field(default_factory=list)
     contaminated: bool = False
@@ -277,6 +298,7 @@ class QuantizationRun:
             "n_quantized_modules": self.n_quantized_modules,
             "expert_carriers": self.expert_carriers,
             "experts_quantized": self.experts_quantized,
+            "exclusion_violations": self.exclusion_violations,
             "export_method": self.export_method,
             "n_fallback_layers": len(self.fallback_layers),
             "fallback_layers": ";".join(self.fallback_layers[:32]),
@@ -328,6 +350,100 @@ def _resolve_quant_config(recipe: Recipe) -> Any:
         "family and record the omission - do not substitute a config with a "
         "different activation width, which would make the two families identical."
     )
+
+
+def _glob_to_quantizer_pattern(pattern: str) -> str:
+    """Turn a recipe module glob into a ModelOpt quantizer-name glob.
+
+    ModelOpt matches its `quant_cfg` keys against *quantizer* names such as
+    `backbone.layers.3.mixer.gate.weight_quantizer`, not module names, so a
+    recipe pattern like `*.mixer.gate` matches nothing unless it is allowed to
+    continue past the module name.
+    """
+    return pattern if pattern.endswith("*") else f"{pattern}*"
+
+
+def build_quant_config(recipe: Recipe) -> dict[str, Any]:
+    """Stock ModelOpt config with the recipe's exclusions applied.
+
+    The recipe used to be inert: only `expert_activation_bits` was read, and
+    the `exclude` list - attention, conv1d, routers, embeddings, mtp heads -
+    never reached ModelOpt at all. The stock NVFP4_DEFAULT_CFG quantizes
+    attention, contradicting both recipes, and nothing prevented a router from
+    being quantized.
+
+    Later keys win in ModelOpt's matching, so disabling entries are appended
+    after the stock rules.
+    """
+    import copy
+
+    stock = _resolve_quant_config(recipe)
+    config: dict[str, Any] = copy.deepcopy(dict(stock))
+    quant_cfg: dict[str, Any] = dict(config.get("quant_cfg", {}))
+
+    for pattern in recipe.exclude_patterns:
+        quant_cfg[_glob_to_quantizer_pattern(pattern)] = {"enable": False}
+
+    config["quant_cfg"] = quant_cfg
+    logger.info(
+        "%s: applied %d exclusion patterns (%d naming routers)",
+        recipe.family.value,
+        len(recipe.exclude_patterns),
+        len(recipe.router_patterns),
+    )
+    return config
+
+
+def _module_matches(name: str, pattern: str) -> bool:
+    from fnmatch import fnmatch
+
+    bare = pattern.rstrip("*")
+    return fnmatch(name, pattern) or fnmatch(name, f"{bare}*") or name.endswith(bare.rstrip("."))
+
+
+def assert_exclusions_respected(model: Any, recipe: Recipe) -> int:
+    """Verify no module the recipe excludes came back quantized.
+
+    Applying the patterns is not the same as them having worked - ModelOpt's
+    matching is by quantizer name and a near-miss fails silently. This checks
+    the result rather than trusting the request, and treats a quantized router
+    as fatal: it would move the routing distribution at the same time as the
+    expert numerics, confounding the only comparison the study makes.
+    """
+    violations: list[str] = []
+    router_violations: list[str] = []
+
+    for name, module in model.named_modules():
+        matched = [p for p in recipe.exclude_patterns if _module_matches(name, p)]
+        if not matched:
+            continue
+        enabled = [q for q in _weight_quantizers(module) if getattr(q, "is_enabled", False)]
+        input_q = getattr(module, "input_quantizer", None)
+        if input_q is not None and getattr(input_q, "is_enabled", False):
+            enabled.append(input_q)
+        if not enabled:
+            continue
+        violations.append(f"{name} (matched {matched[0]})")
+        if any(p in recipe.router_patterns for p in matched):
+            router_violations.append(name)
+
+    if router_violations:
+        raise RecipeMismatchError(
+            f"{len(router_violations)} ROUTER modules were quantized despite being "
+            f"excluded, e.g. {router_violations[:3]}. A perturbed router changes "
+            "which experts fire, so routing and expert numerics would move "
+            "together and no measured difference could be attributed to either. "
+            "This invalidates the run."
+        )
+    if violations:
+        logger.warning(
+            "%d excluded modules were quantized anyway, e.g. %s. The recipe's "
+            "precision map is not being honoured; check ModelOpt's pattern "
+            "matching before trusting the comparison.",
+            len(violations),
+            violations[:5],
+        )
+    return len(violations)
 
 
 def run_single_quantization(
@@ -432,7 +548,7 @@ def run_single_quantization(
         try:
             import modelopt.torch.quantization as mtq
 
-            quant_cfg = _resolve_quant_config(recipe)
+            quant_cfg = build_quant_config(recipe)
             forward_loop = build_forward_loop(
                 texts,
                 tokenizer,
@@ -449,6 +565,7 @@ def run_single_quantization(
             run.expert_carriers, run.experts_quantized = assert_experts_quantized(
                 model, family=family
             )
+            run.exclusion_violations = assert_exclusions_respected(model, recipe)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             run.export_method = _export_checkpoint(model, tokenizer, checkpoint_dir)
 
@@ -534,7 +651,10 @@ def _weight_quantizers(module: Any) -> list[Any]:
     found: list[Any] = []
     containers: dict[str, Any] = {}
     containers.update(getattr(module, "_modules", {}) or {})
-    containers.update({k: v for k, v in vars(module).items() if not k.startswith("__")})
+    # Not every object exposes __dict__ (slots, C extensions), and this runs
+    # inside a guard - raising here would abort an otherwise valid run.
+    with contextlib.suppress(TypeError):
+        containers.update({k: v for k, v in vars(module).items() if not k.startswith("__")})
     for name, value in containers.items():
         if "weight_quantizer" not in name:
             continue
@@ -758,9 +878,11 @@ __all__ = [
     "Recipe",
     "RecipeMismatchError",
     "UnquantizedExpertsError",
+    "assert_exclusions_respected",
     "assert_experts_quantized",
     "assert_recipe_identity",
     "build_forward_loop",
+    "build_quant_config",
     "count_routed_expert_carriers",
     "load_calibration_texts",
     "load_recipe",

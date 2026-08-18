@@ -1137,3 +1137,183 @@ class TestReportDoesNotAssertAbsentMechanisms:
             Config(), Artifacts(per_document_profiles=self._profiles(malay_only_experts=True))
         )
         assert "is the mechanism the study set out to test" in report
+
+
+class TestRecipeDrivesModelOpt:
+    """The recipe's exclude list used to be inert: only expert_activation_bits
+    was read, so attention, conv1d, embeddings and - critically - ROUTERS were
+    never excluded in fact, only on paper."""
+
+    @pytest.fixture
+    def cfg(self) -> Config:
+        return Config()
+
+    def test_exclusions_reach_the_quant_config(self, cfg: Config, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        import ilmu_glossary.quantize as q
+
+        stock = {"quant_cfg": {"*weight_quantizer": {"num_bits": 4}}, "algorithm": "max"}
+        monkeypatch.setattr(q, "_resolve_quant_config", lambda _r: stock)
+        recipe = q.load_recipe(cfg, RecipeFamily.W4A16_SHIPPED)
+        built = q.build_quant_config(recipe)
+
+        assert built["quant_cfg"]["*weight_quantizer"] == {"num_bits": 4}, "stock rules kept"
+        disabled = [k for k, v in built["quant_cfg"].items() if v == {"enable": False}]
+        assert len(disabled) == len(recipe.exclude_patterns)
+        assert any("gate" in k for k in disabled), "router exclusion must reach ModelOpt"
+        assert stock["quant_cfg"] == {"*weight_quantizer": {"num_bits": 4}}, "stock not mutated"
+
+    def test_recipe_names_a_router_exclusion(self, cfg: Config) -> None:
+        from ilmu_glossary.quantize import load_recipe
+
+        for family in RecipeFamily:
+            assert load_recipe(cfg, family).router_patterns
+
+    def test_quantized_router_is_fatal(self, cfg: Config) -> None:
+        """A perturbed router moves the routing distribution at the same time as
+        expert numerics, so no difference could be attributed to either."""
+        from ilmu_glossary.quantize import RecipeMismatchError, assert_exclusions_respected
+
+        class Q:
+            is_enabled = True
+
+        class Mod:
+            def __init__(self, quantized: bool) -> None:
+                if quantized:
+                    self.weight_quantizer = Q()
+
+        class Model:
+            def named_modules(self):  # type: ignore[no-untyped-def]
+                return [
+                    ("backbone.layers.0.mixer.gate", Mod(True)),
+                    ("backbone.layers.0.mixer.experts.0.up_proj", Mod(True)),
+                ]
+
+        from ilmu_glossary.quantize import load_recipe
+
+        recipe = load_recipe(cfg, RecipeFamily.W4A16_SHIPPED)
+        with pytest.raises(RecipeMismatchError, match="ROUTER"):
+            assert_exclusions_respected(Model(), recipe)
+
+    def test_clean_model_passes(self, cfg: Config) -> None:
+        from ilmu_glossary.quantize import assert_exclusions_respected, load_recipe
+
+        class Model:
+            def named_modules(self):  # type: ignore[no-untyped-def]
+                return [("backbone.layers.0.mixer.gate", object())]
+
+        assert (
+            assert_exclusions_respected(Model(), load_recipe(cfg, RecipeFamily.W4A16_SHIPPED)) == 0
+        )
+
+
+class TestPhase4Guards:
+    """Phase 4 previously only logged that splits existed."""
+
+    def test_contaminated_calibration_is_rejected(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.config import PathsConfig
+        from ilmu_glossary.evaluate import assert_evaluation_is_clean
+        from ilmu_glossary.io import write_jsonl
+        from ilmu_glossary.splits import ContaminationError, make_split
+
+        cfg = Config(paths=PathsConfig(root=tmp_path))
+        splits = {"formal_bm": make_split("formal_bm", 100, base_seed=42)}
+        leaked = f"formal_bm:{splits['formal_bm'].eval_indices[0]}"
+        write_jsonl(
+            [{"id": leaked, "text": "x"}],
+            cfg.paths.resolve("calibration_sets") / "bm_only_16.jsonl",
+        )
+        with pytest.raises(ContaminationError):
+            assert_evaluation_is_clean(cfg, "w4a16_shipped_bm_only_16", splits)
+
+    def test_oracle_is_allowed_to_be_contaminated(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.config import PathsConfig
+        from ilmu_glossary.evaluate import assert_evaluation_is_clean
+        from ilmu_glossary.io import write_jsonl
+        from ilmu_glossary.splits import make_split
+
+        cfg = Config(paths=PathsConfig(root=tmp_path))
+        splits = {"formal_bm": make_split("formal_bm", 100, base_seed=42)}
+        leaked = f"formal_bm:{splits['formal_bm'].eval_indices[0]}"
+        write_jsonl(
+            [{"id": leaked, "text": "x"}],
+            cfg.paths.resolve("calibration_sets") / "oracle_contaminated_16.jsonl",
+        )
+        assert_evaluation_is_clean(cfg, "w4a16_shipped_oracle_contaminated_16", splits)
+
+    def test_clean_calibration_passes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.config import PathsConfig
+        from ilmu_glossary.evaluate import assert_evaluation_is_clean
+        from ilmu_glossary.io import write_jsonl
+        from ilmu_glossary.splits import make_split
+
+        cfg = Config(paths=PathsConfig(root=tmp_path))
+        splits = {"formal_bm": make_split("formal_bm", 100, base_seed=42)}
+        clean = f"formal_bm:{splits['formal_bm'].train_indices[0]}"
+        write_jsonl(
+            [{"id": clean, "text": "x"}],
+            cfg.paths.resolve("calibration_sets") / "bm_only_16.jsonl",
+        )
+        assert_evaluation_is_clean(cfg, "w4a16_shipped_bm_only_16", splits)
+
+
+class TestReportSurfacesNewTiers:
+    def test_per_class_kl_section_present(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        frame = pd.DataFrame(
+            [
+                {
+                    "checkpoint": "c",
+                    "variant": "bm_only",
+                    "contaminated": False,
+                    "corpus_class": "manglish",
+                    "n_documents": 10,
+                    "kl_mean": 0.31,
+                },
+                {
+                    "checkpoint": "c",
+                    "variant": "bm_only",
+                    "contaminated": False,
+                    "corpus_class": "formal_bm",
+                    "n_documents": 10,
+                    "kl_mean": 0.08,
+                },
+            ]
+        )
+        report = build_report(Config(), Artifacts(kl_per_class=frame))
+        assert "Per-class KL, classes unmerged" in report
+        assert "manglish" in report
+
+    def test_throughput_without_reference_confirms_nothing(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        frame = pd.DataFrame(
+            [{"checkpoint": "c", "concurrency": 1, "output_tokens_per_sec": 100.0}]
+        )
+        assert "confirms\nnothing yet" in build_report(
+            Config(), Artifacts(throughput=frame)
+        ).replace("confirms nothing yet", "confirms\nnothing yet")
+
+    def test_throughput_regression_is_surfaced(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        frame = pd.DataFrame(
+            [
+                {
+                    "checkpoint": "c",
+                    "concurrency": 8,
+                    "output_tokens_per_sec": 50.0,
+                    "throughput_vs_reference": -0.42,
+                    "regression_flagged": True,
+                }
+            ]
+        )
+        assert "Throughput regression flagged" in build_report(
+            Config(), Artifacts(throughput=frame)
+        )
+
+    def test_missing_ppl_delta_is_called_out(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        frame = pd.DataFrame([{"corpus_class": "formal_bm", "perplexity": 24.0}])
+        assert "Absolute perplexity only" in build_report(Config(), Artifacts(ppl=frame))
