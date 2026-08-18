@@ -451,7 +451,7 @@ def _module_matches(name: str, pattern: str) -> bool:
     return fnmatch(name, pattern) or fnmatch(name, f"{bare}*") or name.endswith(bare.rstrip("."))
 
 
-def assert_exclusions_respected(model: Any, recipe: Recipe) -> int:
+def assert_exclusions_respected(model: Any, recipe: Recipe, *, strict: bool = True) -> int:
     """Verify no module the recipe excludes came back quantized.
 
     Applying the patterns is not the same as them having worked - ModelOpt's
@@ -462,9 +462,11 @@ def assert_exclusions_respected(model: Any, recipe: Recipe) -> int:
     """
     violations: list[str] = []
     router_violations: list[str] = []
+    matched_any: set[str] = set()
 
     for name, module in model.named_modules():
         matched = [p for p in recipe.exclude_patterns if _module_matches(name, p)]
+        matched_any.update(matched)
         if not matched:
             continue
         enabled = [q for q in _weight_quantizers(module) if getattr(q, "is_enabled", False)]
@@ -476,6 +478,36 @@ def assert_exclusions_respected(model: Any, recipe: Recipe) -> int:
         violations.append(f"{name} (matched {matched[0]})")
         if any(p in recipe.router_patterns for p in matched):
             router_violations.append(name)
+
+    # A pattern that matches nothing is the failure mode this whole guard
+    # exists to catch: the recipe would look enforced while the modules it
+    # names go on being quantized under a different namespace. Nemotron uses
+    # `backbone.layers.N.mixer.*`; a recipe written against `model.layers.N.mlp.*`
+    # would silently exclude nothing at all.
+    unmatched = [p for p in recipe.exclude_patterns if p not in matched_any]
+    if unmatched:
+        unmatched_routers = [p for p in unmatched if p in recipe.router_patterns]
+        if unmatched_routers and strict:
+            raise RecipeMismatchError(
+                f"Router exclusion pattern(s) {unmatched_routers} matched no module "
+                "in this architecture. The routers are therefore NOT excluded, and "
+                "whether they were quantized is down to ModelOpt's defaults rather "
+                "than this recipe. Fix the pattern to the model's actual module "
+                "namespace before trusting any result."
+            )
+        if unmatched_routers:
+            logger.warning(
+                "Router exclusion pattern(s) %s matched no module. Not fatal "
+                "because this is a dry run against a proxy whose namespace "
+                "differs by design - it WOULD be fatal in a real run.",
+                unmatched_routers,
+            )
+        logger.warning(
+            "%d exclusion pattern(s) matched no module: %s. They are inert here - "
+            "verify they name this architecture's modules.",
+            len(unmatched),
+            unmatched,
+        )
 
     if router_violations:
         raise RecipeMismatchError(
@@ -615,7 +647,11 @@ def run_single_quantization(
             run.expert_carriers, run.experts_quantized = assert_experts_quantized(
                 model, family=family
             )
-            run.exclusion_violations = assert_exclusions_respected(model, recipe)
+            # The dry-run proxy has a different module namespace to Nemotron,
+            # so an unmatched pattern there is expected rather than a defect.
+            run.exclusion_violations = assert_exclusions_respected(
+                model, recipe, strict=not cfg.dry_run
+            )
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             run.export_method = _export_checkpoint(model, tokenizer, checkpoint_dir)
 

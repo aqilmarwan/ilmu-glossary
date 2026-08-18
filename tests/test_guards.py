@@ -1377,3 +1377,62 @@ class TestQuantConfigListForm:
         recipe = q.load_recipe(Config(), RecipeFamily.W4A16_SHIPPED)
         with pytest.raises(q.RecipeMismatchError, match="Unrecognised"):
             q.build_quant_config(recipe)
+
+
+class TestExclusionPatternsMustMatchSomething:
+    """A pattern that matches nothing is how a silent confound arises: the
+    recipe looks enforced while the modules it names go on being quantized.
+    Nemotron uses backbone.layers.N.mixer.*; a recipe written against
+    model.layers.N.mlp.* would exclude nothing at all."""
+
+    class _Model:
+        def __init__(self, names: list[str]) -> None:
+            self._names = names
+
+        def named_modules(self):  # type: ignore[no-untyped-def]
+            return [(n, object()) for n in self._names]
+
+    def test_unmatched_router_pattern_is_fatal(self) -> None:
+        from ilmu_glossary.quantize import (
+            RecipeMismatchError,
+            assert_exclusions_respected,
+            load_recipe,
+        )
+
+        recipe = load_recipe(Config(), RecipeFamily.W4A16_SHIPPED)
+        # Qwen-style namespace: none of Nemotron's mixer.* patterns match.
+        wrong_namespace = self._Model(["model.layers.0.mlp.gate", "model.layers.0.mlp.experts"])
+        with pytest.raises(RecipeMismatchError, match="matched no module"):
+            assert_exclusions_respected(wrong_namespace, recipe)
+
+    def test_dry_run_downgrades_to_a_warning(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        """The proxy's namespace differs by design, so a dry run must not abort -
+        but it must still say so."""
+        import logging
+
+        from ilmu_glossary.quantize import assert_exclusions_respected, load_recipe
+
+        recipe = load_recipe(Config(), RecipeFamily.W4A16_SHIPPED)
+        with caplog.at_level(logging.WARNING):
+            assert_exclusions_respected(
+                self._Model(["model.layers.0.mlp.gate"]), recipe, strict=False
+            )
+        assert "WOULD be fatal in a real run" in caplog.text
+
+    def test_matching_namespace_passes(self) -> None:
+        from ilmu_glossary.quantize import assert_exclusions_respected, load_recipe
+
+        recipe = load_recipe(Config(), RecipeFamily.W4A16_SHIPPED)
+        correct = self._Model(
+            [
+                "backbone.layers.0.mixer.q_proj",
+                "backbone.layers.0.mixer.k_proj",
+                "backbone.layers.0.mixer.v_proj",
+                "backbone.layers.0.mixer.o_proj",
+                "backbone.layers.0.mixer.conv1d",
+                "backbone.layers.0.mixer.gate",
+                "backbone.embeddings",
+                "mtp.layers.0",
+            ]
+        )
+        assert assert_exclusions_respected(correct, recipe) == 0
