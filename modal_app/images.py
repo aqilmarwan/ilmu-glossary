@@ -88,9 +88,12 @@ gpu_image = (
         f"torch=={TORCH_VERSION}",
         index_url="https://download.pytorch.org/whl/cu128",
     )
+    # NB: the [hf] extra conflicts with vllm 0.27.1 (it pins transformers<5
+    # while vllm requires 5.x). ModelOpt warns that transformers 5 is untested;
+    # the mtq path used here works regardless.
     .pip_install(
         f"vllm=={VLLM_VERSION}",
-        f"nvidia-modelopt[hf]=={MODELOPT_VERSION}",
+        f"nvidia-modelopt=={MODELOPT_VERSION}",
         "accelerate>=1.2",
         "flashinfer-python>=0.2",
     )
