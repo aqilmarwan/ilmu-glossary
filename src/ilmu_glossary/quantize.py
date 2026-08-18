@@ -257,6 +257,7 @@ class QuantizationRun:
     n_quantized_modules: int = 0
     expert_carriers: int = 0
     experts_quantized: int = 0
+    export_method: str = ""
     fallback_layers: list[str] = field(default_factory=list)
     contaminated: bool = False
     error: str | None = None
@@ -276,6 +277,7 @@ class QuantizationRun:
             "n_quantized_modules": self.n_quantized_modules,
             "expert_carriers": self.expert_carriers,
             "experts_quantized": self.experts_quantized,
+            "export_method": self.export_method,
             "n_fallback_layers": len(self.fallback_layers),
             "fallback_layers": ";".join(self.fallback_layers[:32]),
             "contaminated": self.contaminated,
@@ -448,8 +450,7 @@ def run_single_quantization(
                 model, family=family
             )
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(checkpoint_dir)
-            tokenizer.save_pretrained(checkpoint_dir)
+            run.export_method = _export_checkpoint(model, tokenizer, checkpoint_dir)
 
         except Exception as exc:
             run.error = repr(exc)
@@ -597,6 +598,42 @@ def assert_experts_quantized(model: Any, *, family: str) -> tuple[int, int]:
         )
     logger.info("%s: %d/%d routed-expert carriers quantized", family, quantized, carriers)
     return carriers, quantized
+
+
+def _export_checkpoint(model: Any, tokenizer: Any, checkpoint_dir: Path) -> str:
+    """Write a quantized checkpoint, preferring ModelOpt's HF exporter.
+
+    `model.save_pretrained` fails under transformers 5.x with
+    "IndexError: Dimension specified as 0 but tensor has no dimensions" - its
+    `revert_weight_conversion` pass calls `tensor.size(0)` on the 0-dim scalar
+    amax tensors ModelOpt attaches.
+
+    ModelOpt's own exporter is the right tool regardless: it emits
+    `hf_quant_config.json` alongside the weights, which is exactly the format
+    NVIDIA's published NVFP4 checkpoint ships and what vLLM reads to select
+    NVFP4 kernels. Saving via transformers would produce a checkpoint that
+    loads as BF16.
+    """
+    try:
+        from modelopt.torch.export import export_hf_checkpoint
+
+        export_hf_checkpoint(model, export_dir=str(checkpoint_dir))
+        tokenizer.save_pretrained(checkpoint_dir)
+        if not (checkpoint_dir / "hf_quant_config.json").exists():
+            logger.warning(
+                "export_hf_checkpoint wrote no hf_quant_config.json; vLLM will "
+                "load this checkpoint as BF16 and every quantization result "
+                "from it would be meaningless."
+            )
+        return "modelopt.export_hf_checkpoint"
+    except ImportError:
+        logger.warning("ModelOpt exporter unavailable; falling back to save_pretrained")
+    except Exception as exc:
+        logger.warning("ModelOpt export failed (%r); falling back to save_pretrained", exc)
+
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+    return "transformers.save_pretrained"
 
 
 def _previous_run(checkpoint_dir: Path) -> dict[str, Any] | None:
