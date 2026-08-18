@@ -203,7 +203,9 @@ def phase3_quantize(
     gpu="B200",
     volumes=VOLUMES,
     secrets=SECRETS,
-    timeout=6 * HOURS,
+    # Calibration at NVIDIA's 1024 samples x 32,768 tokens on a 30B model,
+    # plus two full KL captures, does not fit in 6 hours.
+    timeout=12 * HOURS,
 )
 def phase3_quantize_and_eval(
     config_yaml: str | None = None,

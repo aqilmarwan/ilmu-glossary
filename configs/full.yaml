@@ -202,7 +202,14 @@ quant:
 
 eval:
   kl_top_k: 512
-  kl_max_pairs: 5000
+  # 1,500 of the 15,000 available pairs. Reasoning, stated rather than
+  # silently chosen: at 200 pairs the delta CI was +/-0.004 against an effect
+  # of 0.0139. 1,500 narrows that ~2.7x to ~+/-0.0015, which is ample. Going
+  # to 5,000 buys 1.8x more precision for 3.3x the GPU hours, and the
+  # scientifically load-bearing number is calibration fidelity (1024 @ 32K),
+  # not pair count. Raise this if the effect turns out smaller than the pilot
+  # suggested.
+  kl_max_pairs: 1500
   kl_max_tokens_per_side: 4096
   ppl_max_docs_per_class: 2000
   ppl_stride: 2048
