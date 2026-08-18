@@ -9,7 +9,6 @@ that resumability has one definition rather than six.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
@@ -87,7 +86,7 @@ def write_parquet(
     stamped = stamp(df, fingerprint=fingerprint, phase=phase)
     tmp = path.with_suffix(path.suffix + ".tmp")
     stamped.to_parquet(tmp, index=False, compression="zstd")
-    os.replace(tmp, path)
+    tmp.replace(path)
     return path
 
 
@@ -131,7 +130,7 @@ def write_jsonl(records: Iterable[dict[str, Any]], path: Path, *, overwrite: boo
         for record in records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
-    os.replace(tmp, path)
+    tmp.replace(path)
     return count
 
 
@@ -165,7 +164,7 @@ def write_json(payload: dict[str, Any], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
-    os.replace(tmp, path)
+    tmp.replace(path)
     return path
 
 

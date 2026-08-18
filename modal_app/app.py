@@ -159,9 +159,7 @@ def phase3_quantize(
     from ilmu_glossary.quantize import run_single_quantization
 
     cfg = _load_config(config_yaml, dry_run)
-    result = run_single_quantization(
-        cfg, variant=variant, sample_count=sample_count, family=family
-    )
+    result = run_single_quantization(cfg, variant=variant, sample_count=sample_count, family=family)
     volume.commit()
     return result
 

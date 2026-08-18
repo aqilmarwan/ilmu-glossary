@@ -55,7 +55,7 @@ def seed_everything(base_seed: int, *tags: str | int) -> int:
     """
     seed = derive_seed(base_seed, *tags)
     random.seed(seed)
-    np.random.seed(seed)  # noqa: NPY002 - intentional global seeding
+    np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     try:

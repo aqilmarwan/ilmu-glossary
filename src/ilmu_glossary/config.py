@@ -275,17 +275,86 @@ class LidConfig(BaseModel):
 
     # Layer 3: discriminative lexicon. Presence of Indonesian-only forms is
     # evidence against Malaysian provenance even when fastText is confident.
+    #
+    # The two lists MUST stay disjoint. A form common to both languages
+    # ("saya", "tidak", "macam", "kenapa", "sangat", "cuma", "buat", "anda")
+    # contributes to both ratios and cancels out, adding noise while
+    # discriminating nothing. `_check_markers_disjoint` enforces this.
     indonesian_markers: tuple[str, ...] = (
-        "bisa", "mobil", "kamu", "gimana", "kenapa sih", "banget",
-        "nggak", "enggak", "udah", "aja", "doang", "kayak", "cuma",
-        "sekarang ini", "bikin", "ngapain", "lu", "gue",
+        # lexical: standard Indonesian where Malay uses a different word
+        "bisa",
+        "mobil",
+        "kamu",
+        "mau",
+        "kenapa sih",
+        "sepeda",
+        "ban",
+        "cewek",
+        "cowok",
+        "ngomong",
+        "bicara",
+        "kantor",
+        "bilang",
+        # colloquial Jakarta forms with no Malaysian counterpart
+        "gimana",
+        "banget",
+        "nggak",
+        "enggak",
+        "udah",
+        "aja",
+        "doang",
+        "kayak",
+        "bikin",
+        "ngapain",
+        "lu",
+        "gue",
+        "sih",
+        "dong",
+        "kok",
+        "deh",
+        "nih",
+        "tuh",
+        "banget banget",
     )
     malaysian_markers: tuple[str, ...] = (
-        "boleh", "kereta", "anda", "macam mana", "kenapa", "sangat",
-        "tak", "tidak", "dah", "je", "sahaja", "macam", "cuma",
-        "buat", "apa khabar", "awak", "saya",
+        # lexical: Malaysian standard where Indonesian differs
+        "kereta",
+        "basikal",
+        "tayar",
+        "pejabat",
+        "cakap",
+        "jom",
+        "kedai",
+        "wang",
+        "cikgu",
+        "rasuah",
+        "gaduh",
+        # colloquial Malaysian particles and contractions
+        "nak",
+        "tak",
+        "dah",
+        "je",
+        "korang",
+        "awak",
+        "macam mana",
+        "apa khabar",
+        "sahaja",
+        "boleh",
+        "tengok",
+        "kat",
     )
     max_indonesian_marker_ratio: float = 0.02
+
+    @model_validator(mode="after")
+    def _check_markers_disjoint(self) -> Self:
+        overlap = set(self.indonesian_markers) & set(self.malaysian_markers)
+        if overlap:
+            raise ValueError(
+                "indonesian_markers and malaysian_markers overlap on "
+                f"{sorted(overlap)}. A shared form contributes to both ratios "
+                "and discriminates nothing."
+            )
+        return self
 
 
 class CalibrationConfig(BaseModel):

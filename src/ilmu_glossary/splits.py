@@ -81,7 +81,7 @@ def make_split(
 
     generator = rng(base_seed, "split", corpus_class)
     permuted = generator.permutation(total)
-    n_train = int(round(total * train_fraction))
+    n_train = round(total * train_fraction)
     # Guarantee both sides are non-empty; a class with one held-out document
     # cannot support a perplexity estimate but should fail loudly later, not here.
     n_train = min(max(n_train, 1), total - 1)
