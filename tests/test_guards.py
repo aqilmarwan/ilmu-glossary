@@ -122,13 +122,44 @@ class TestRecipeIdentity:
             assert_recipe_identity(recipes)
 
     def test_routers_excluded_from_quantization(self, cfg: Config) -> None:
-        """A perturbed router changes which experts fire, confounding everything."""
+        """A perturbed router changes which experts fire, confounding everything.
+
+        Nemotron-H names the router `mixer.gate`; other architectures call it
+        `router`. Either spelling satisfies the requirement - what matters is
+        that the routing distribution cannot move while expert numerics do.
+        """
         from ilmu_glossary.quantize import load_recipe
 
         for family in RecipeFamily:
             excluded = load_recipe(cfg, family).payload["quantization"]["exclude"]
-            assert any("gate" in pattern for pattern in excluded)
-            assert any("router" in pattern for pattern in excluded)
+            assert any("gate" in pattern or "router" in pattern for pattern in excluded), (
+                f"{family.value} does not exclude the router: {excluded}"
+            )
+
+    def test_routed_experts_are_quantized_by_both_families(self, cfg: Config) -> None:
+        """Both families must actually target routed experts, or the contrast
+        between them says nothing."""
+        from ilmu_glossary.quantize import load_recipe
+
+        for family in RecipeFamily:
+            layers = load_recipe(cfg, family).payload["quantization"]["layers"]
+            expert_patterns = [
+                layer["pattern"]
+                for layer in layers
+                if "experts" in layer["pattern"] and "shared" not in layer["pattern"]
+            ]
+            assert expert_patterns, f"{family.value} quantizes no routed experts"
+
+    def test_lm_head_matches_nvidia(self, cfg: Config) -> None:
+        """NVIDIA quantizes lm_head - their 'faithful lm_head'. An earlier draft
+        excluded it, which would have diverged from the shipped checkpoint."""
+        from ilmu_glossary.quantize import load_recipe
+
+        for family in RecipeFamily:
+            payload = load_recipe(cfg, family).payload["quantization"]
+            patterns = [layer["pattern"] for layer in payload["layers"]]
+            assert "lm_head" in patterns
+            assert "lm_head" not in payload["exclude"]
 
 
 # --------------------------------------------------------------------------
