@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 
 from ilmu_glossary import tracking
-from ilmu_glossary.config import Config, CorpusClass, SourceSpec
+from ilmu_glossary.config import Config, CorpusClass, RecordFormat, SourceSpec
 from ilmu_glossary.io import count_jsonl, read_jsonl, write_json, write_jsonl, write_parquet
 from ilmu_glossary.lid import (
     LanguageIdentifier,
@@ -182,12 +182,84 @@ class IngestManifest:
         }
 
 
-def stream_source(spec: SourceSpec, *, limit: int | None = None) -> Iterator[dict[str, Any]]:
-    """Yield raw records from one upstream dataset.
+def extract_text(record: Any, spec: SourceSpec) -> str | None:
+    """Pull the document text out of one record, honouring its shape.
+
+    The upstream repos are bare JSONL dumps and their line shapes genuinely
+    differ - verified by reading the first line of each on 2026-08-18:
+
+      malaysia-ai/dedup-text-dataset          a bare JSON string per line
+      chatgpt-noisy-translation-manglish      [tag, text, {translations}]
+      fineweb-edu / codeparrot                {"text": ...} / {"content": ...}
+
+    Assuming the object shape everywhere is what produced
+    "'str' object is not a mapping" on the first dry run.
+    """
+    fmt = spec.record_format
+
+    if fmt is RecordFormat.BARE_STRING:
+        return record if isinstance(record, str) else None
+
+    if fmt is RecordFormat.JSON_ARRAY:
+        if not isinstance(record, list) or len(record) <= spec.array_text_index:
+            return None
+        value = record[spec.array_text_index]
+        return value if isinstance(value, str) else None
+
+    if isinstance(record, dict):
+        value = record.get(spec.text_field)
+        return value if isinstance(value, str) else None
+    if isinstance(record, str):
+        # A source declared as objects that turns out to hold strings is
+        # recoverable; log nothing here, the manifest counts it.
+        return record
+    return None
+
+
+def _stream_raw_jsonl(spec: SourceSpec, *, limit: int | None = None) -> Iterator[Any]:
+    """Read named JSONL files from a Hub repo line by line.
+
+    `datasets` cannot infer a schema across 300+ heterogeneous bare-JSONL
+    files, and its json builder rejects lines that are not objects. Reading
+    the lines directly sidesteps both problems and keeps the sampling
+    reproducible, since the file list is pinned in config.
+    """
+    import json as json_mod
+
+    from huggingface_hub import hf_hub_download
+
+    yielded = 0
+    for filename in spec.data_files:
+        try:
+            path = hf_hub_download(spec.repo_id, filename, repo_type="dataset")
+        except Exception as exc:
+            logger.warning("Could not fetch %s/%s: %r", spec.repo_id, filename, exc)
+            continue
+
+        with Path(path).open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json_mod.loads(line)
+                except json_mod.JSONDecodeError:
+                    continue
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+
+
+def stream_source(spec: SourceSpec, *, limit: int | None = None) -> Iterator[Any]:
+    """Yield raw records from one upstream source.
 
     Streaming is non-negotiable for the bulk corpus. `datasets` is imported
     lazily so this module stays importable where it is absent.
     """
+    if spec.loader == "raw_jsonl":
+        yield from _stream_raw_jsonl(spec, limit=limit)
+        return
+
     from datasets import load_dataset
 
     kwargs: dict[str, Any] = {"split": spec.split, "streaming": spec.streaming}
@@ -237,9 +309,38 @@ def classify_document(
     if source_provenance == "english":
         if identifier.is_english(text):
             return ClassificationOutcome(CorpusClass.ENGLISH_CONTROL, "lid_english")
+        # Without the fastText models every document reads as "unknown", which
+        # emptied english_control entirely on the first dry run. The source is
+        # declared English; trust that rather than the unavailable classifier.
+        if identifier.degraded and cfg.lid.trust_provenance_when_degraded:
+            return ClassificationOutcome(
+                CorpusClass.ENGLISH_CONTROL, "provenance_english_lid_degraded"
+            )
         return ClassificationOutcome(None, "english_source_but_not_english")
 
     result = identifier.identify(text)
+
+    # Degraded mode: fastText is unavailable, so `verdict` is always "unknown"
+    # and every Malay class would come out empty. Fall back to the lexicon,
+    # which still rejects Indonesian-marked text - weaker, and recorded as
+    # such in corpus_stats via the lid_degraded column.
+    if identifier.degraded and cfg.lid.trust_provenance_when_degraded:
+        if result.indonesian_marker_ratio > result.malaysian_marker_ratio:
+            return ClassificationOutcome(None, "lexicon_indonesian", result.to_dict())
+        switched, ratio = detect_intrasentential_switching(text)
+        evidence = {**result.to_dict(), "switch_ratio": ratio}
+        if switched:
+            return ClassificationOutcome(
+                CorpusClass.CODE_SWITCHED, "degraded_intrasentential", evidence
+            )
+        dialect_name, hits = detect_dialect(text)
+        if dialect_name is not None:
+            return ClassificationOutcome(
+                CorpusClass.DIALECT, f"degraded_dialect_{dialect_name}", {**evidence, "hits": hits}
+            )
+        if result.malaysian_marker_ratio > 0:
+            return ClassificationOutcome(CorpusClass.FORMAL_BM, "degraded_lexicon_malay", evidence)
+        return ClassificationOutcome(None, "degraded_no_malay_signal", evidence)
 
     if result.verdict == "indonesian":
         return ClassificationOutcome(None, "indonesian", result.to_dict())
@@ -407,7 +508,10 @@ def build_parallel_corpus(
 
     pairs: list[dict[str, Any]] = []
     manifest = IngestManifest(source=",".join(s.repo_id for s in specs))
-    target = cfg.data.min_parallel_pairs * 3  # oversample; verification prunes
+    # Oversample so alignment verification can prune without dropping under
+    # the minimum. Scaled down for the dry run, whose purpose is plumbing.
+    minimum = cfg.data.min_parallel_pairs if not cfg.dry_run else 32
+    target = minimum * 3
 
     for spec in specs:
         for record in stream_source(spec):
@@ -458,7 +562,7 @@ def build_parallel_corpus(
         "n_pairs": len(pairs),
         "verified_sample_size": sample_size,
         "verified_pass_rate": pass_rate,
-        "meets_minimum": len(pairs) >= cfg.data.min_parallel_pairs,
+        "meets_minimum": len(pairs) >= minimum,
         "manifest": manifest.to_dict(),
     }
     logger.info(
@@ -467,29 +571,69 @@ def build_parallel_corpus(
         100 * pass_rate,
         sample_size,
     )
-    if len(pairs) < cfg.data.min_parallel_pairs:
+    if len(pairs) < minimum:
         logger.error(
             "Parallel corpus has %d pairs, below the %d minimum. The primary "
             "metric (tier 1 BM-EN KL delta) rests on this corpus - a short one "
             "weakens the only tier that supports the causal claim.",
             len(pairs),
-            cfg.data.min_parallel_pairs,
+            minimum,
         )
     return pairs, report
 
 
-def _extract_pair(record: dict[str, Any]) -> tuple[str | None, str | None]:
+# mesolitica's translation instructions wrap the source text in backticks and
+# append a Malay instruction naming the TARGET language, e.g.
+#   input : `isnt that hybrid more expensive ...` terjemah ke melayu
+#   output: Bukankah hibrid itu lebih mahal ...
+# The target named in the instruction decides which side is Malay. Reading
+# (input, output) as (ms, en) - the obvious guess - gets it exactly backwards.
+_BACKTICK_RE = re.compile(r"`(.+?)`", re.DOTALL)
+_TO_MALAY_RE = re.compile(r"terjemah\s+ke\s+(bahasa\s+)?(melayu|malay)", re.I)
+_TO_ENGLISH_RE = re.compile(r"terjemah\s+ke\s+(bahasa\s+)?(inggeris|english)", re.I)
+
+
+def _parse_instruction_pair(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Recover (malay, english) from an instruction-formatted translation record."""
+    instruction = record.get("input")
+    output = record.get("output")
+    if not isinstance(instruction, str) or not isinstance(output, str):
+        return None, None
+
+    match = _BACKTICK_RE.search(instruction)
+    if match is None:
+        return None, None
+    source = match.group(1).strip()
+    target = output.strip()
+
+    if _TO_MALAY_RE.search(instruction):
+        return target, source  # output is Malay, backticked source is English
+    if _TO_ENGLISH_RE.search(instruction):
+        return source, target  # backticked source is Malay, output is English
+    return None, None
+
+
+def _extract_pair(record: Any) -> tuple[str | None, str | None]:
     """Pull the BM and EN sides out of a record.
 
     mesolitica's translation datasets are not schema-consistent across repos,
-    so several field conventions are tried before giving up.
+    so several conventions are tried before giving up.
     """
+    if not isinstance(record, dict):
+        return None, None
+
+    # Instruction format first - it is the one that would otherwise be
+    # silently mis-assigned by the (input, output) convention below.
+    if "output" in record and isinstance(record.get("input"), str):
+        malay, english = _parse_instruction_pair(record)
+        if malay and english:
+            return malay, english
+
     candidates = [
         ("ms", "en"),
         ("malay", "english"),
         ("src", "tgt"),
         ("translation_ms", "translation_en"),
-        ("input", "output"),
     ]
     for ms_key, en_key in candidates:
         if ms_key in record and en_key in record:
@@ -703,8 +847,8 @@ def run_phase0(cfg: Config) -> dict[str, Any]:
                         if _all_classes_full(buffers, target, cfg):
                             break
 
-                        text = record.get(spec.text_field)
-                        if not isinstance(text, str):
+                        text = extract_text(record, spec)
+                        if text is None:
                             manifest.records_rejected["missing_text_field"] += 1
                             continue
 

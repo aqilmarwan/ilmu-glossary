@@ -224,6 +224,21 @@ class VllmConfig(BaseModel):
         return args
 
 
+class RecordFormat(StrEnum):
+    """Physical shape of one line in an upstream JSONL file.
+
+    These repos are bare JSONL dumps rather than curated datasets, and the
+    shapes genuinely differ - verified 2026-08-18 by reading the first line
+    of each. Assuming `{"text": ...}` everywhere is what made phase 0 fail
+    with "'str' object is not a mapping".
+    """
+
+    OBJECT = "object"  # {"text": "..."}          fineweb-edu, codeparrot
+    BARE_STRING = "bare_string"  # "..."          malaysia-ai/dedup-text-dataset
+    JSON_ARRAY = "json_array"  # [tag, text, {...}]  chatgpt-noisy-translation
+    INSTRUCTION_PAIR = "instruction_pair"  # {prompt_input, input, output}
+
+
 class SourceSpec(BaseModel):
     """One upstream dataset feeding one or more corpus classes."""
 
@@ -234,6 +249,13 @@ class SourceSpec(BaseModel):
     config_name: str | None = None
     split: str = "train"
     text_field: str = "text"
+
+    # `datasets` schema inference fails on bare-JSONL repos with hundreds of
+    # heterogeneous files, so those are read line by line instead.
+    loader: Literal["datasets", "raw_jsonl"] = "datasets"
+    data_files: tuple[str, ...] = ()
+    record_format: RecordFormat = RecordFormat.OBJECT
+    array_text_index: int = 1
     # Streaming avoids materialising the 90B-token pretrain corpus. Spec
     # reproducibility is preserved by pinning `revision` and recording the
     # number of records consumed per shard in the manifest.
@@ -284,6 +306,15 @@ class LidConfig(BaseModel):
     primary_model: str = "mesolitica/fasttext-language-detection-v2"
     ms_id_model: str = "mesolitica/fasttext-language-detection-ms-id"
     quantized: bool = True
+    # Both repos publish `fasttext.ftz` / `fasttext.bin`, not the `model.*`
+    # convention. Verified against the Hub 2026-08-18.
+    weights_filename: str = "fasttext.ftz"
+    weights_filename_full: str = "fasttext.bin"
+    # When the fastText models cannot be loaded the identifier degrades to
+    # lexicon-only. In that mode a source whose provenance is declared
+    # English or code is trusted rather than rejected - otherwise the control
+    # classes come out empty, which is what happened on the first dry run.
+    trust_provenance_when_degraded: bool = True
     # A document must clear this to be admitted to a Malay class.
     min_malay_prob: float = 0.70
     # And must not look more Indonesian than Malay by this margin.
@@ -638,6 +669,7 @@ __all__ = [
     "PathsConfig",
     "QuantConfig",
     "RecipeFamily",
+    "RecordFormat",
     "SourceSpec",
     "TrackingConfig",
     "VllmConfig",

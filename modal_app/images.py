@@ -59,7 +59,9 @@ cpu_image = (
     # fastText wheels are unreliable on 3.12; build from the pinned source.
     .pip_install("fasttext-wheel>=0.9.2")
     .env(_ENV)
-    .add_local_python_source("ilmu_glossary")
+    # Both packages: `modal_app` because app.py imports images.py from it,
+    # `ilmu_glossary` because that is the pipeline itself.
+    .add_local_python_source("ilmu_glossary", "modal_app")
     # Phase 3 reads recipes/*.yaml at run time; the python-source mount does
     # not carry them, and a missing recipe fails hours into a run.
     .add_local_dir("recipes", remote_path="/root/recipes")
@@ -95,7 +97,7 @@ gpu_image = (
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         }
     )
-    .add_local_python_source("ilmu_glossary")
+    .add_local_python_source("ilmu_glossary", "modal_app")
     .add_local_dir("recipes", remote_path="/root/recipes")
 )
 

@@ -123,7 +123,9 @@ def marker_ratios(text: str, cfg: LidConfig) -> tuple[float, float, int]:
 
 
 @lru_cache(maxsize=4)
-def _load_fasttext(repo_id: str, quantized: bool) -> _FastTextModel | None:
+def _load_fasttext(
+    repo_id: str, quantized: bool, filename: str = "fasttext.ftz", fallback: str = "fasttext.bin"
+) -> _FastTextModel | None:
     """Download and load one mesolitica fastText model.
 
     Returns None rather than raising so the pipeline can fall back to the
@@ -137,16 +139,16 @@ def _load_fasttext(repo_id: str, quantized: bool) -> _FastTextModel | None:
         logger.warning("fasttext not installed; LID falls back to lexicon only")
         return None
 
-    filename = "model.ftz" if quantized else "model.bin"
+    # mesolitica publishes fasttext.ftz / fasttext.bin, not the model.* naming.
+    wanted = filename if quantized else fallback
+    alt = fallback if quantized else filename
     try:
-        path = hf_hub_download(repo_id=repo_id, filename=filename)
+        path = hf_hub_download(repo_id=repo_id, filename=wanted)
     except Exception:
-        # Repos differ in filename convention; try the other one before giving up.
-        alt = "model.bin" if quantized else "model.ftz"
         try:
             path = hf_hub_download(repo_id=repo_id, filename=alt)
         except Exception as exc:
-            logger.warning("Could not fetch %s from %s: %r", filename, repo_id, exc)
+            logger.warning("Could not fetch %s or %s from %s: %r", wanted, alt, repo_id, exc)
             return None
 
     try:
@@ -194,8 +196,12 @@ class LanguageIdentifier:
 
     def __init__(self, cfg: LidConfig) -> None:
         self.cfg = cfg
-        self._primary = _load_fasttext(cfg.primary_model, cfg.quantized)
-        self._ms_id = _load_fasttext(cfg.ms_id_model, cfg.quantized)
+        self._primary = _load_fasttext(
+            cfg.primary_model, cfg.quantized, cfg.weights_filename, cfg.weights_filename_full
+        )
+        self._ms_id = _load_fasttext(
+            cfg.ms_id_model, cfg.quantized, cfg.weights_filename, cfg.weights_filename_full
+        )
         self.degraded = self._primary is None
         if self.degraded:
             logger.warning(

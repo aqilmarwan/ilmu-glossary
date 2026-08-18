@@ -40,54 +40,72 @@ data:
 
   sources:
     formal_bm:
-      # 349 GB JSONL / ~90B tokens. Streamed, never downloaded in bulk;
-      # the manifest records how many records were consumed per shard.
+      # Bare-JSONL repo: every line is a JSON *string*, not an object, and the
+      # 312 files do not share a schema - `datasets` inference fails with
+      # "'str' object is not a mapping". Read line by line from a pinned file
+      # list instead, which is also what makes the sample reproducible.
       - repo_id: malaysia-ai/dedup-text-dataset
         kind: hf_dataset
-        split: train
-        text_field: text
-        streaming: true
+        loader: raw_jsonl
+        record_format: bare_string
         provenance: malaysian
         licence: unverified
-        notes: >-
-          Bulk Malaysian text. Mixed register - the LID and register filters
-          in data_prep.py separate formal prose from the social-media tail.
+        data_files:
+          - utusan.jsonl
+          - sinarharian.jsonl
+          - bernama.com-tam.jsonl
+          - kosmo.jsonl
+          - mstar.com.my.jsonl
+          - agendadaily.jsonl
+          - amanz.jsonl
+        notes: Malaysian news and formal prose.
 
     manglish:
+      # Lines are JSON arrays: [tag, manglish_text, {translations}].
       - repo_id: mesolitica/chatgpt-noisy-translation-manglish
         kind: hf_dataset
-        split: train
-        text_field: text
-        streaming: true
+        loader: raw_jsonl
+        record_format: json_array
+        array_text_index: 1
         provenance: malaysian
         licence: unverified
-        notes: Colloquial Malaysian English / Manglish.
+        data_files:
+          - filtered-manglish.jsonl
+          - process-manglish.jsonl
+        notes: >-
+          Colloquial Malaysian English / Manglish. Yield is low (~0.5% of
+          lines clear min_doc_chars) because social posts are short - see
+          the manglish note in README before the production run.
 
     code_switched:
-      # Sourced by filtering the bulk corpus for intra-sentential BM-EN
-      # alternation. There is no ready-made HF dataset for this; see
-      # data_prep.detect_intrasentential_switching.
+      # Malaysian forums, filtered for within-sentence BM-EN alternation by
+      # data_prep.detect_intrasentential_switching (spec section 3.3).
       - repo_id: malaysia-ai/dedup-text-dataset
         kind: hf_dataset
-        split: train
-        text_field: text
-        streaming: true
+        loader: raw_jsonl
+        record_format: bare_string
         provenance: malaysian
         licence: unverified
-        notes: >-
-          Filtered for within-sentence BM-EN alternation, not alternating
-          documents (spec section 3.3).
+        data_files:
+          - lowyat.jsonl
+          - c.cari.com.my.jsonl
+          - carigold.jsonl
+          - iium-confession.jsonl
+        notes: Forum text, the richest source of intra-sentential switching.
 
     dialect:
       # Optional class. Spec section 3.4 permits dropping it below 2,000 docs
       # rather than padding with formal BM.
       - repo_id: malaysia-ai/dedup-text-dataset
         kind: hf_dataset
-        split: train
-        text_field: text
-        streaming: true
+        loader: raw_jsonl
+        record_format: bare_string
         provenance: malaysian
         licence: unverified
+        data_files:
+          - b.cari.com.my.jsonl
+          - facebook.jsonl
+          - mycarforum.jsonl
         notes: Filtered for Kelantanese/Kedahan/Sarawakian regional markers.
 
     english_control:
@@ -96,6 +114,7 @@ data:
         config_name: sample-10BT
         split: train
         text_field: text
+        record_format: object
         streaming: true
         provenance: english
         licence: ODC-By-1.0
@@ -103,13 +122,12 @@ data:
 
     code_control:
       # bigcode/the-stack-smol is GATED (verified 2026-08-18) and would stall
-      # phase 0 waiting on a licence click. codeparrot-clean-valid is ungated
-      # and serves the same purpose - the code class is a control, so its
-      # exact provenance matters less than that it is unambiguously code.
+      # phase 0 waiting on a licence click.
       - repo_id: codeparrot/codeparrot-clean-valid
         kind: hf_dataset
         split: train
         text_field: content
+        record_format: object
         streaming: true
         provenance: code
         licence: multiple-see-upstream
@@ -118,13 +136,21 @@ data:
           accept its licence on the Hub - it is the better corpus, just gated.
 
     parallel_bm_en:
+      # Instruction format: `<source>` terjemah ke melayu -> output is Malay.
+      # The target language named in the instruction decides which side is
+      # which; reading (input, output) as (ms, en) gets it backwards.
       - repo_id: mesolitica/noisy-standard-malay-translation-instructions
         kind: hf_dataset
-        split: train
-        text_field: text
-        streaming: true
+        loader: raw_jsonl
+        record_format: instruction_pair
         provenance: mixed
         licence: unverified
+        data_files:
+          - lowyat-instructions.jsonl
+          - b.cari.com.my-instructions.jsonl
+          - c.cari.com.my-instructions.jsonl
+          - facebook-instructions.jsonl
+          - iium-confession-instructions.jsonl
         notes: >-
           Aligned BM/EN pairs. Substrate for the primary metric - content,
           topic and difficulty held constant so divergence is attributable

@@ -25,6 +25,11 @@ from modal_app.images import cpu_image, gpu_image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+# HF streaming issues one ranged GET per chunk and logs each at INFO, which
+# buries our own progress lines under tens of thousands of signed URLs.
+for _noisy in ("httpx", "httpcore", "urllib3", "filelock", "fsspec"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 APP_NAME = "ilmu-glossary"
 
 app = modal.App(APP_NAME)
