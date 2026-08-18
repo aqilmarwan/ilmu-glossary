@@ -902,3 +902,48 @@ class TestMalayMmluPrompt:
         assert strip_option_letter("B) Sifer") == ("B", "Sifer")
         assert strip_option_letter("(C) Teks") == ("C", "Teks")
         assert strip_option_letter("no letter here") == (None, "no letter here")
+
+
+class TestCrossMmluParsing:
+    """SeaEval keeps each language in a COLUMN of one `test` split, with
+    choices lettered "(A) ...". Treating language as a split raises
+    Unknown split "malay" and tier 3 silently loads nothing."""
+
+    CELL: ClassVar[dict[str, object]] = {
+        "question": "According to Adler, firstborn children are more likely to be",
+        "choices": ["(A) responsible", "(B) funny", "(C) sociable", "(D) followers"],
+        "answer": "(A) responsible",
+    }
+
+    def test_letters_stripped_and_answer_resolved(self) -> None:
+        from ilmu_glossary.evaluate.mmlu import _parse_cross_mmlu_cell
+
+        q = _parse_cross_mmlu_cell(self.CELL, "test_1", "english")
+        assert q is not None
+        assert q.options == ("responsible", "funny", "sociable", "followers")
+        assert q.answer_letter == "A"
+        assert not q.options_in_question
+
+    def test_options_rendered_once(self) -> None:
+        from ilmu_glossary.evaluate.mmlu import _parse_cross_mmlu_cell
+
+        q = _parse_cross_mmlu_cell(self.CELL, "test_1", "english")
+        assert q is not None
+        prompt = q.prompt()
+        for text in ("responsible", "funny", "sociable", "followers"):
+            assert prompt.count(text) == 1
+
+    def test_non_parallel_languages_are_flagged(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        """Tier 3 is the controlled comparison; misalignment must not pass silently."""
+        import logging
+
+        from ilmu_glossary.evaluate.mmlu import MCQuestion, _assert_parallel
+
+        def q(qid: str, lang: str) -> MCQuestion:
+            return MCQuestion(qid, "x", ("a", "b"), 0, language=lang)
+
+        with caplog.at_level(logging.WARNING):
+            _assert_parallel(
+                {"english": [q("1", "english"), q("2", "english")], "malay": [q("1", "malay")]}
+            )
+        assert "absent from at least one" in caplog.text

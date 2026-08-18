@@ -211,57 +211,111 @@ def _parse_malay_mmlu_record(record: dict[str, Any]) -> MCQuestion | None:
 def load_cross_mmlu(cfg: Config) -> dict[str, list[MCQuestion]]:
     """Load SeaEval Cross-MMLU, one parallel question list per language.
 
-    Parallelism is the point: the same 900 questions in each language. The
-    loader asserts the per-language counts match, because a silently
-    misaligned language column would turn a controlled comparison into an
-    uncontrolled one.
+    Schema, verified against the Hub on 2026-08-18: a single `test` split of
+    150 rows where each **language is a column**, not a split - `English`,
+    `Malay`, `Indonesian`, `Chinese`, `Spanish`, `Vietnamese`, `Filipino` -
+    and every cell is a dict of `question` / `choices` / `answer` with choices
+    lettered "(A) ...". Treating the language as a split raises
+    `Unknown split "malay"`.
+
+    Parallelism is the whole point of tier 3: the same question id carries
+    across every language, so accuracy differences are attributable to
+    language rather than to content. That is asserted rather than assumed.
     """
     from datasets import load_dataset
 
+    try:
+        dataset = load_dataset(cfg.eval.cross_mmlu_repo, cfg.eval.cross_mmlu_config, split="test")
+    except Exception as exc:
+        logger.error("Cross-MMLU unavailable: %r. Tier 3 cannot run.", exc)
+        return {}
+
+    columns = set(dataset.column_names)
     by_language: dict[str, list[MCQuestion]] = {}
 
     for language in cfg.eval.cross_mmlu_languages:
-        try:
-            dataset = load_dataset(
-                cfg.eval.cross_mmlu_repo,
-                cfg.eval.cross_mmlu_config,
-                split=language,
+        column = language.capitalize()
+        if column not in columns:
+            logger.warning(
+                "Cross-MMLU has no %r column; available: %s",
+                column,
+                sorted(columns - {"id"}),
             )
-        except Exception as exc:
-            logger.warning("Cross-MMLU split %s unavailable: %r", language, exc)
             continue
 
         items: list[MCQuestion] = []
         for record in dataset:
-            options = record.get("choices") or record.get("options")
-            if not isinstance(options, list) or len(options) < 2:
+            cell = record.get(column)
+            if not isinstance(cell, dict):
                 continue
-            answer = record.get("answer")
-            index = _resolve_answer_index(answer, [str(o) for o in options])
-            if index is None:
-                continue
-            items.append(
-                MCQuestion(
-                    question_id=str(record.get("id", len(items))),
-                    question=str(record.get("question", "")),
-                    options=tuple(strip_option_letter(str(o))[1] for o in options),
-                    answer_index=index,
-                    subject=str(record.get("category", "")),
-                    language=language,
-                )
-            )
+            question = _parse_cross_mmlu_cell(cell, str(record.get("id", len(items))), language)
+            if question is not None:
+                items.append(question)
         by_language[language] = items
 
-    counts = {lang: len(items) for lang, items in by_language.items()}
-    if len(set(counts.values())) > 1:
-        logger.warning(
-            "Cross-MMLU language splits are not parallel: %s. The controlled "
-            "cross-language comparison assumes the same questions in each "
-            "language; report this alongside tier 3 results.",
-            counts,
-        )
-    logger.info("Cross-MMLU: %s", counts)
+    _assert_parallel(by_language)
+    logger.info("Cross-MMLU: %s", {k: len(v) for k, v in by_language.items()})
     return by_language
+
+
+def _parse_cross_mmlu_cell(cell: dict[str, Any], qid: str, language: str) -> MCQuestion | None:
+    """Normalise one language cell. Choices arrive lettered as "(A) ..."."""
+    choices = cell.get("choices")
+    if not isinstance(choices, list) or len(choices) < 2:
+        return None
+
+    stripped = [strip_option_letter(str(c))[1] for c in choices]
+    answer = cell.get("answer")
+    index: int | None = None
+
+    if isinstance(answer, str):
+        letter, text = strip_option_letter(answer)
+        if letter and letter in LETTERS[: len(stripped)]:
+            index = LETTERS.index(letter)
+        else:
+            for i, option in enumerate(stripped):
+                if option == text:
+                    index = i
+                    break
+    elif isinstance(answer, int) and 0 <= answer < len(stripped):
+        index = answer
+
+    if index is None:
+        return None
+
+    return MCQuestion(
+        question_id=qid,
+        question=str(cell.get("question", "")),
+        options=tuple(stripped),
+        answer_index=index,
+        language=language,
+        # Cross-MMLU keeps the question and its choices separate.
+        options_in_question=False,
+    )
+
+
+def _assert_parallel(by_language: dict[str, list[MCQuestion]]) -> None:
+    """Warn loudly if the language columns are not question-for-question aligned.
+
+    Tier 3 is the controlled cross-language comparison; if the languages hold
+    different questions it silently becomes an uncontrolled one.
+    """
+    populated = {lang: items for lang, items in by_language.items() if items}
+    if len(populated) < 2:
+        return
+
+    id_sets = {lang: {q.question_id for q in items} for lang, items in populated.items()}
+    shared = set.intersection(*id_sets.values())
+    for lang, ids in id_sets.items():
+        missing = len(ids - shared)
+        if missing:
+            logger.warning(
+                "Cross-MMLU %s carries %d question ids absent from at least one "
+                "other language. Tier 3 assumes the same questions in every "
+                "language; report this alongside its results.",
+                lang,
+                missing,
+            )
 
 
 def _resolve_answer_index(answer: Any, options: list[str]) -> int | None:
