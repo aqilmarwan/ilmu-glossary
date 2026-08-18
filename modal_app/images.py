@@ -39,6 +39,7 @@ _HOST_DEPS = [
     "transformers>=4.48",
     "mlflow>=2.19",
     "tqdm>=4.67",
+    "tabulate>=0.9",
 ]
 
 _ENV = {
