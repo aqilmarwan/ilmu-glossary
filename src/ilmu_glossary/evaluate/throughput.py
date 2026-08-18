@@ -312,9 +312,35 @@ def run_fallback_benchmark(
     )
 
 
+def _warm_up(cfg: Config, handle: Any, artifact_root: Path) -> None:
+    """Absorb one-off startup costs before anything is measured.
+
+    A freshly launched container pays FlashInfer cubin downloads and Triton
+    JIT on its first requests. Measured on the dry run, the first checkpoint
+    benchmarked came out 51-61% slower than an identical model measured later
+    with warm caches - enough to swamp any real throughput difference and to
+    trip the regression check on nothing.
+    """
+    result = run_aiperf(
+        cfg,
+        handle,
+        concurrency=max(cfg.eval.throughput_concurrencies),
+        checkpoint_label="_warmup",
+        artifact_root=artifact_root,
+        n_requests=cfg.eval.throughput_warmup_requests * 2,
+    )
+    logger.info(
+        "Throughput warm-up complete (%s); its numbers are discarded",
+        "aiperf" if result else "fallback",
+    )
+    if result is None:
+        run_fallback_benchmark(cfg, handle, concurrency=1, checkpoint_label="_warmup")
+
+
 def benchmark_checkpoint(cfg: Config, handle: Any, checkpoint_label: str) -> pd.DataFrame:
     """Sweep every configured concurrency level for one served checkpoint."""
     artifact_root = cfg.paths.resolve("results") / "aiperf"
+    _warm_up(cfg, handle, artifact_root)
     rows: list[dict[str, Any]] = []
     for concurrency in cfg.eval.throughput_concurrencies:
         result = run_aiperf(
@@ -353,9 +379,26 @@ def regression_check(
     Recalibration changes scale values, not kernels, so throughput should be
     flat. A flagged row means something else changed and the accuracy
     comparison for that checkpoint needs explaining before it is trusted.
+
+    Caveat this tier carries: reference and checkpoint are measured in
+    separate containers, and cross-container variance was large on the dry run
+    even for an identical model. `_warm_up` removes the dominant cause, but a
+    flag near the tolerance should be reproduced before being believed.
     """
     if df.empty or reference_checkpoint not in set(df["checkpoint"]):
         return df
+
+    # Never difference an AIPerf measurement against a fallback one: AIPerf
+    # reports streaming TTFT while the fallback reports whole-request latency,
+    # so the two differ by orders of magnitude on the same server.
+    if "measured_by" in df.columns and df["measured_by"].nunique() > 1:
+        logger.warning(
+            "Throughput rows were produced by different instruments (%s). They "
+            "measure different quantities and are not comparable, so no "
+            "regression verdict is issued.",
+            sorted(df["measured_by"].dropna().unique()),
+        )
+        return df.assign(throughput_vs_reference=float("nan"), regression_flagged=False)
 
     reference = df[df["checkpoint"] == reference_checkpoint].set_index("concurrency")
     rows: list[dict[str, Any]] = []

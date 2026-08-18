@@ -1436,3 +1436,49 @@ class TestExclusionPatternsMustMatchSomething:
             ]
         )
         assert assert_exclusions_respected(correct, recipe) == 0
+
+
+class TestThroughputComparability:
+    """Tier 4e exists to confirm recalibration costs no throughput. Two ways it
+    can report a confident non-answer: differencing across instruments, and
+    cold-cache variance."""
+
+    @staticmethod
+    def _frame(measured_by: list[str]) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "checkpoint": "bf16_reference",
+                    "concurrency": 8,
+                    "output_tokens_per_sec": 100.0,
+                    "measured_by": measured_by[0],
+                },
+                {
+                    "checkpoint": "cand",
+                    "concurrency": 8,
+                    "output_tokens_per_sec": 160.0,
+                    "measured_by": measured_by[1],
+                },
+            ]
+        )
+
+    def test_mixed_instruments_issue_no_verdict(self) -> None:
+        """AIPerf reports streaming TTFT, the fallback whole-request latency;
+        differencing them would flag a regression that is pure instrument."""
+        from ilmu_glossary.evaluate.throughput import regression_check
+
+        out = regression_check(
+            self._frame(["fallback", "aiperf"]), reference_checkpoint="bf16_reference"
+        )
+        assert not out["regression_flagged"].any()
+        assert out["throughput_vs_reference"].isna().all()
+
+    def test_same_instrument_still_flags(self) -> None:
+        from ilmu_glossary.evaluate.throughput import regression_check
+
+        out = regression_check(
+            self._frame(["aiperf", "aiperf"]), reference_checkpoint="bf16_reference"
+        )
+        flagged = out[out["checkpoint"] == "cand"]
+        assert bool(flagged["regression_flagged"].iloc[0])
+        assert flagged["throughput_vs_reference"].iloc[0] == pytest.approx(0.6)
