@@ -47,6 +47,11 @@ _ENV = {
     # roughly triples throughput on Modal's network.
     "HF_HUB_ENABLE_HF_TRANSFER": "1",
     "HF_HOME": "/hf-cache",
+    # MLflow 3 refuses to start on a filesystem store unless this is set.
+    # The file store is the right backend here despite the deprecation:
+    # phase 3 and 4 fan out across many containers writing concurrently to
+    # the shared volume, which a single sqlite file would serialise badly.
+    "MLFLOW_ALLOW_FILE_STORE": "true",
     "TOKENIZERS_PARALLELISM": "false",
     "PYTHONUNBUFFERED": "1",
 }
