@@ -978,3 +978,61 @@ class TestCrossMmluParsing:
                 {"english": [q("1", "english"), q("2", "english")], "malay": [q("1", "malay")]}
             )
         assert "absent from at least one" in caplog.text
+
+
+class TestFusedExpertQuantizerDetection:
+    """nvidia-modelopt >= 0.45 quantizes fused MoE experts via
+    _QuantFusedExperts, which attaches `gate_up_proj_weight_quantizers` /
+    `down_proj_weight_quantizers` as per-expert collections rather than a
+    single `weight_quantizer`. A detector that looks only for the latter
+    reports zero quantized experts on a correctly quantized checkpoint and
+    aborts a valid run."""
+
+    class _Q:
+        def __init__(self, enabled: bool = True) -> None:
+            self.is_enabled = enabled
+
+    class _Fused:
+        """Mimics QuantQwen2MoeExperts' attribute layout."""
+
+        def __init__(self, enabled: bool) -> None:
+            self.gate_up_proj_weight_quantizers = [
+                TestFusedExpertQuantizerDetection._Q(enabled) for _ in range(4)
+            ]
+            self.down_proj_weight_quantizers = [
+                TestFusedExpertQuantizerDetection._Q(enabled) for _ in range(4)
+            ]
+            self.gate_up_proj_input_quantizer = TestFusedExpertQuantizerDetection._Q(enabled)
+
+    def test_fused_collections_are_detected(self) -> None:
+        from ilmu_glossary.quantize import _weight_quantizers
+
+        quantizers = _weight_quantizers(self._Fused(enabled=True))
+        assert len(quantizers) == 8, "expected both 4-expert weight collections"
+        assert all(q.is_enabled for q in quantizers)
+
+    def test_disabled_fused_quantizers_are_not_counted_as_enabled(self) -> None:
+        from ilmu_glossary.quantize import _weight_quantizers
+
+        assert not any(q.is_enabled for q in _weight_quantizers(self._Fused(enabled=False)))
+
+    def test_unfused_single_quantizer_still_works(self) -> None:
+        from ilmu_glossary.quantize import _weight_quantizers
+
+        class Unfused:
+            def __init__(self) -> None:
+                self.weight_quantizer = TestFusedExpertQuantizerDetection._Q(True)
+
+        assert len(_weight_quantizers(Unfused())) == 1
+
+    def test_input_quantizer_is_not_mistaken_for_a_weight_quantizer(self) -> None:
+        """Activation quantizers must not satisfy the weight-quantized check;
+        the w4a16 family has activation quantizers nowhere and would otherwise
+        look identical to w4a4."""
+        from ilmu_glossary.quantize import _weight_quantizers
+
+        class ActOnly:
+            def __init__(self) -> None:
+                self.gate_up_proj_input_quantizer = TestFusedExpertQuantizerDetection._Q(True)
+
+        assert _weight_quantizers(ActOnly()) == []

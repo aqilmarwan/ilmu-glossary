@@ -502,27 +502,70 @@ def _is_routed_expert(name: str) -> bool:
     return "expert" in lowered and "shared" not in lowered
 
 
+def _iter_quantizers(value: Any, _depth: int = 0) -> Any:
+    """Yield every TensorQuantizer reachable from `value`.
+
+    Quantizers are attached under different names and shapes depending on the
+    layout. An unfused Linear carries a single `weight_quantizer`; ModelOpt's
+    `_QuantFusedExperts` carries `gate_up_proj_weight_quantizers` and
+    `down_proj_weight_quantizers` as *collections*, one per expert.
+    """
+    if value is None or _depth > 3:
+        return
+    if hasattr(value, "is_enabled"):
+        yield value
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            yield from _iter_quantizers(item, _depth + 1)
+        return
+    children = getattr(value, "children", None)
+    if callable(children):
+        try:
+            for child in children():
+                yield from _iter_quantizers(child, _depth + 1)
+        except Exception:
+            return
+
+
+def _weight_quantizers(module: Any) -> list[Any]:
+    """Every weight quantizer attached to a module, whatever the layout calls it."""
+    found: list[Any] = []
+    containers: dict[str, Any] = {}
+    containers.update(getattr(module, "_modules", {}) or {})
+    containers.update({k: v for k, v in vars(module).items() if not k.startswith("__")})
+    for name, value in containers.items():
+        if "weight_quantizer" not in name:
+            continue
+        found.extend(_iter_quantizers(value))
+    return found
+
+
 def count_routed_expert_carriers(model: Any) -> tuple[int, int]:
     """(modules holding routed-expert weights, how many of them are quantized).
 
     transformers 5.x fuses MoE experts into batched 3D parameters on a single
-    module - Qwen2MoeExperts carries `gate_up_proj` of shape
-    (num_experts, 2*intermediate, hidden) rather than exposing one nn.Linear
-    per expert. ModelOpt's Linear-targeting configs therefore never see them.
+    module - `Qwen2MoeExperts` carries `gate_up_proj` of shape
+    (num_experts, 2*intermediate, hidden), and Nemotron-H the same at
+    (128, 1856, 2688) - rather than exposing one nn.Linear per expert.
     Counting *carriers* rather than Linears is what makes this detectable on
-    both the fused and unfused layouts.
+    both layouts.
+
+    Quantizer detection has to be layout-agnostic too: nvidia-modelopt >= 0.45
+    handles the fused case via `_QuantFusedExperts`, which attaches
+    `gate_up_proj_weight_quantizers` / `down_proj_weight_quantizers` rather
+    than a single `weight_quantizer`. Looking only for the latter reports zero
+    quantized experts on a checkpoint that is in fact correctly quantized.
     """
     carriers = 0
     quantized = 0
     for name, module in model.named_modules():
         if not _is_routed_expert(name):
             continue
-        params = [p for _, p in module.named_parameters(recurse=False)]
-        if not params:
+        if not any(True for _ in module.named_parameters(recurse=False)):
             continue
         carriers += 1
-        weight_quantizer = getattr(module, "weight_quantizer", None)
-        if weight_quantizer is not None and getattr(weight_quantizer, "is_enabled", False):
+        if any(getattr(q, "is_enabled", False) for q in _weight_quantizers(module)):
             quantized += 1
     return carriers, quantized
 
@@ -544,15 +587,13 @@ def assert_experts_quantized(model: Any, *, family: str) -> tuple[int, int]:
             "routed experts are still full precision - so those numbers would "
             "say nothing about the hypothesis under test.\n\n"
             "Most likely cause: transformers 5.x fuses MoE experts into batched "
-            "3D parameters (e.g. Qwen2MoeExperts.gate_up_proj of shape "
-            "(num_experts, 2*intermediate, hidden)) instead of one nn.Linear per "
-            "expert, and ModelOpt's Linear-targeting configs skip them. Check "
-            "whether ModelOpt's fused-MoE plugin loaded - a warning reading "
-            "\"Failed to import vllm plugin ... has no attribute 'FusedMoE'\" "
-            "means it did not, and that plugin is the fused-MoE path.\n\n"
-            "Fixes, in order of preference: pin a modelopt/vllm pair whose MoE "
-            "plugin imports; pin transformers to a version that keeps experts "
-            "unfused; or add an explicit fused-expert quantization path."
+            "3D parameters (Qwen2MoeExperts.gate_up_proj, Nemotron-H "
+            "mixer.experts at (128, 1856, 2688)) instead of one nn.Linear per "
+            "expert. nvidia-modelopt < 0.45 has no fused-MoE path and skips "
+            "them entirely; >= 0.45 logs 'Detected fused MoE experts ... "
+            "registering with _QuantFusedExperts' and handles them.\n\n"
+            "Fix: pin nvidia-modelopt >= 0.45. Downgrading transformers is NOT "
+            "a workaround for Nemotron - 4.57.1 cannot load nemotron_h at all."
         )
     logger.info("%s: %d/%d routed-expert carriers quantized", family, quantized, carriers)
     return carriers, quantized

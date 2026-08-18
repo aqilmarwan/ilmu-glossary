@@ -22,25 +22,28 @@ PYTHON_VERSION = "3.12"
 # exist on B200/B300/GB200.
 VLLM_VERSION = "0.27.1"
 
-# transformers 5.x FUSES MoE experts into batched 3D parameters - a single
-# Qwen2MoeExperts module carrying gate_up_proj of shape
-# (num_experts, 2*intermediate, hidden) - instead of one nn.Linear per expert.
-# ModelOpt's Linear-targeting configs then skip every routed expert, and PTQ
-# silently produces a checkpoint whose experts are still full precision.
+# transformers 5.x FUSES MoE experts into batched 3D parameters - one
+# Qwen2MoeExperts / Nemotron-H mixer.experts module carrying gate_up_proj of
+# shape (num_experts, 2*intermediate, hidden) - instead of one nn.Linear per
+# expert. nvidia-modelopt < 0.45 has no fused path and skips every routed
+# expert, silently producing a checkpoint whose experts are full precision.
 #
-# Measured on Qwen1.5-MoE-A2.7B, routed-expert nn.Linear modules:
-#   transformers 5.15.0 -> 0
-#   transformers 4.57.1 -> 4320   (24 layers x 60 experts x 3 projections)
+# nvidia-modelopt 0.45 handles it, logging
+#   "Detected fused MoE experts '...' of type Qwen2MoeExperts,
+#    registering with _QuantFusedExperts"
+# and attaching gate_up_proj_weight_quantizers / down_proj_weight_quantizers
+# rather than a single weight_quantizer.
 #
-# Serving needs transformers 5.x (vLLM 0.27.1 requires it) while PTQ needs
-# 4.x. Since PTQ never imports vLLM, the two live in separate images.
-PTQ_TRANSFORMERS_VERSION = "4.57.1"
+# Downgrading transformers is NOT an alternative: 4.57.1 keeps Qwen experts
+# unfused (4320 Linears vs 0) but cannot load nemotron_h at all, so it fixes
+# the proxy and breaks the actual target.
+PTQ_TRANSFORMERS_VERSION = "5.15.0"
 # vLLM 0.27.1 resolves its own torch; the observed runtime version inside the
 # image is 2.13.0+cu130 regardless of what is requested here, so this pin is
 # a floor rather than an exact match. Recorded because a silent torch swap
 # changes kernel selection.
 TORCH_VERSION = "2.9.0"
-MODELOPT_VERSION = "0.40.0"
+MODELOPT_VERSION = "0.45.0"
 CUDA_TAG = "12.8.1"
 
 _HOST_DEPS = [
@@ -135,6 +138,10 @@ gpu_image = (
 # Phase 1 shares this image so the expert indices it profiles come from the
 # same module layout phase 3 quantizes. Profiling under one layout and
 # quantizing under another would silently misalign every expert id.
+#
+# It stays separate from the serving image purely to keep vLLM out: ModelOpt's
+# vLLM plugin fails to import against vLLM 0.27.1 ("no attribute 'FusedMoE'"),
+# and PTQ never needs vLLM anyway.
 
 ptq_image = (
     modal.Image.from_registry(
