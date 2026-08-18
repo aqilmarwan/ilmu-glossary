@@ -117,10 +117,20 @@ def _capture_topk(
             logprobs=np.zeros((0, top_k), dtype=np.float32),
         )
 
-    ids = np.zeros((len(tokens), top_k), dtype=np.int32)
-    lps = np.full((len(tokens), top_k), -1e9, dtype=np.float32)
+    # Tokens with no distribution (the first prompt token under echo) carry no
+    # information for a divergence and are dropped rather than contributing a
+    # row of zeros, which would dilute every mean.
+    scored = [t for t in tokens if isinstance(t.get("top_logprobs"), dict) and t["top_logprobs"]]
+    if not scored:
+        return kl_mod.TopKLogprobs(
+            token_ids=np.zeros((0, top_k), dtype=np.int32),
+            logprobs=np.zeros((0, top_k), dtype=np.float32),
+        )
 
-    for i, token in enumerate(tokens):
+    ids = np.zeros((len(scored), top_k), dtype=np.int32)
+    lps = np.full((len(scored), top_k), -1e9, dtype=np.float32)
+
+    for i, token in enumerate(scored):
         pairs = sorted(token["top_logprobs"].items(), key=lambda kv: -kv[1])[:top_k]
         for j, (piece, logprob) in enumerate(pairs):
             ids[i, j] = np.int32(stable_token_id(piece))

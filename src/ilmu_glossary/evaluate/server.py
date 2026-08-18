@@ -255,11 +255,16 @@ def completion_logprobs(
 
     out: list[dict[str, Any]] = []
     for i, token in enumerate(tokens):
+        # With echo=True the first prompt token has no predecessor, so vLLM
+        # reports `null` for both its logprob and its top_logprobs rather than
+        # an empty dict. Normalising here keeps every caller from having to
+        # know that.
+        distribution = top_logprobs[i] if i < len(top_logprobs) else None
         out.append(
             {
                 "token": token,
                 "logprob": token_logprobs[i] if i < len(token_logprobs) else None,
-                "top_logprobs": top_logprobs[i] if i < len(top_logprobs) else {},
+                "top_logprobs": distribution if isinstance(distribution, dict) else {},
             }
         )
     return out
