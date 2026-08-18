@@ -258,6 +258,32 @@ def build_forward_loop(
 
     def forward_loop(model: Any) -> None:
         model.eval()
+        # Calibration only needs activations to flow so the quantizers observe
+        # them; the logits are never read. Computing them over the full
+        # sequence materialises seq_len x vocab_size - at 32,768 x 131,072
+        # that is tens of GiB and OOMs a 180 GB B200 outright. `logits_to_keep`
+        # confines the lm_head to the final position.
+        #
+        # lm_head is itself quantized, so it still needs observations: it gets
+        # one per calibration sample rather than one per token, which is ample
+        # for a per-tensor amax and costs nothing.
+        keep_kwarg: dict[str, Any] = {}
+        for name in ("logits_to_keep", "num_logits_to_keep"):
+            try:
+                import inspect
+
+                if name in inspect.signature(model.forward).parameters:
+                    keep_kwarg = {name: 1}
+                    break
+            except (TypeError, ValueError):
+                continue
+        if not keep_kwarg:
+            logger.warning(
+                "Model.forward exposes no logits_to_keep; calibration will "
+                "materialise full logits and may exhaust GPU memory at long "
+                "sequence lengths."
+            )
+
         with torch.inference_mode():
             for start in range(0, len(texts), batch_size):
                 batch = texts[start : start + batch_size]
@@ -269,9 +295,12 @@ def build_forward_loop(
                     padding=True,
                 )
                 encoded = {k: v.to(device) for k, v in encoded.items()}
-                model(**encoded)
+                model(**encoded, **keep_kwarg)
+                del encoded
                 if (start // max(batch_size, 1)) % 32 == 0:
                     logger.info("  calibration %d/%d", start, len(texts))
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     return forward_loop
 

@@ -156,7 +156,16 @@ ptq_image = (
         index_url="https://download.pytorch.org/whl/cu128",
     )
     .pip_install(f"nvidia-modelopt=={MODELOPT_VERSION}", "accelerate>=1.2")
-    .env({**_ENV, "TORCH_CUDA_ARCH_LIST": "10.0"})
+    .env(
+        {
+            **_ENV,
+            "TORCH_CUDA_ARCH_LIST": "10.0",
+            # Long-sequence calibration allocates in large uneven blocks;
+            # expandable segments avoid fragmenting the 180 GB into pieces too
+            # small to reuse.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+    )
     .add_local_python_source("ilmu_glossary", "modal_app")
     .add_local_dir("recipes", remote_path="/root/recipes")
 )
