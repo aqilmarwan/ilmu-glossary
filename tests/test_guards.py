@@ -1482,3 +1482,80 @@ class TestThroughputComparability:
         flagged = out[out["checkpoint"] == "cand"]
         assert bool(flagged["regression_flagged"].iloc[0])
         assert flagged["throughput_vs_reference"].iloc[0] == pytest.approx(0.6)
+
+
+class TestEnablePatternsMatchBothLayouts:
+    """The same logical weight is named differently depending on fusion:
+
+        unfused  ...mixer.experts.5.up_proj.weight_quantizer
+        fused    ...mixer.experts.up_proj_weight_quantizers.5
+
+    A pattern anchored on the per-expert index matches only the first, which
+    is how the real Nemotron run quantized zero of 23 expert carriers."""
+
+    @staticmethod
+    def _pat(kind: str = "weight_quantizer") -> str:
+        from ilmu_glossary.quantize import _enable_pattern
+
+        return _enable_pattern("*.mixer.experts.*.up_proj", kind)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "model.layers.1.mixer.experts.up_proj_weight_quantizers.0",
+            "backbone.layers.3.mixer.experts.up_proj_weight_quantizers.17",
+            "model.layers.1.mixer.experts.5.up_proj.weight_quantizer",
+        ],
+    )
+    def test_matches_routed_experts(self, name: str) -> None:
+        from fnmatch import fnmatch
+
+        assert fnmatch(name, self._pat())
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "model.layers.1.mixer.shared_experts.up_proj.weight_quantizer",
+            "model.layers.1.mixer.gate.weight_quantizer",
+            "model.layers.1.mixer.q_proj.weight_quantizer",
+            "model.layers.1.mixer.in_proj.weight_quantizer",
+        ],
+    )
+    def test_does_not_match_anything_else(self, name: str) -> None:
+        """Shared experts see every token regardless of routing, and routers
+        must never be quantized."""
+        from fnmatch import fnmatch
+
+        assert not fnmatch(name, self._pat())
+
+    def test_activation_rules_only_for_the_w4a4_family(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """The presence of expert input_quantizers IS the family distinction."""
+        import ilmu_glossary.quantize as q
+
+        stock = {
+            "quant_cfg": [
+                {"quantizer_name": "*", "enable": False},
+                {
+                    "quantizer_name": "*mlp*weight_quantizer",
+                    "cfg": {"num_bits": (2, 1), "block_sizes": {-1: 32}},
+                },
+                {
+                    "quantizer_name": "*mlp*input_quantizer",
+                    "cfg": {"num_bits": (2, 1), "block_sizes": {-1: 32}},
+                },
+            ],
+            "algorithm": "max",
+        }
+        monkeypatch.setattr(q, "_resolve_quant_config", lambda _r: stock)
+
+        def expert_rules(family: RecipeFamily, kind: str) -> list[str]:
+            built = q.build_quant_config(q.load_recipe(Config(), family))
+            return [
+                r["quantizer_name"]
+                for r in built["quant_cfg"]
+                if "experts" in r["quantizer_name"] and kind in r["quantizer_name"]
+            ]
+
+        assert expert_rules(RecipeFamily.W4A16_SHIPPED, "weight_quantizer")
+        assert not expert_rules(RecipeFamily.W4A16_SHIPPED, "input_quantizer")
+        assert expert_rules(RecipeFamily.W4A4_MECHANISM, "input_quantizer")

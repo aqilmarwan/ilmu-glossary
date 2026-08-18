@@ -88,6 +88,12 @@ class Recipe:
         )
 
     @property
+    def quantized_layers(self) -> tuple[dict[str, Any], ...]:
+        """Layer rules the recipe says to quantize, with their formats."""
+        layers = self.payload.get("quantization", {}).get("layers", []) or []
+        return tuple(dict(layer) for layer in layers if layer.get("pattern"))
+
+    @property
     def group_size(self) -> int | None:
         """NVFP4 block size the recipe specifies for routed experts.
 
@@ -367,6 +373,41 @@ def _resolve_quant_config(recipe: Recipe) -> Any:
     )
 
 
+def _template_cfg(rules: list[Any], quantizer_kind: str) -> dict[str, Any] | None:
+    """Borrow a quantizer cfg block from the stock config.
+
+    The numeric settings - num_bits, block_sizes, scale_bits - are what makes
+    a rule NVFP4. Reusing the stock config's own block keeps this study's
+    numerics identical to NVIDIA's while retargeting which modules they apply
+    to.
+    """
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        name = str(rule.get("quantizer_name", ""))
+        cfg = rule.get("cfg")
+        if quantizer_kind in name and isinstance(cfg, dict) and "num_bits" in cfg:
+            return cfg
+    return None
+
+
+def _enable_pattern(module_pattern: str, kind: str) -> str:
+    """Recipe module glob -> a quantizer glob that matches both MoE layouts.
+
+    The same logical weight is named differently depending on whether experts
+    are fused:
+
+      unfused  ...mixer.experts.5.up_proj.weight_quantizer
+      fused    ...mixer.experts.up_proj_weight_quantizers.5
+
+    A pattern anchored on the per-expert index matches only the first, which
+    is how the real Nemotron run quantized zero experts. Collapsing the
+    interior separators to wildcards matches both.
+    """
+    core = module_pattern.replace(".*.", "*").replace("*.", "*").rstrip("*.")
+    return f"{core}*{kind}*"
+
+
 def _glob_to_quantizer_pattern(pattern: str) -> str:
     """Turn a recipe module glob into a ModelOpt quantizer-name glob.
 
@@ -400,6 +441,46 @@ def build_quant_config(recipe: Recipe) -> dict[str, Any]:
     group_size = recipe.group_size
 
     if isinstance(rules, list):
+        # Stock configs carry namespace assumptions: NVFP4_MLP_WEIGHT_ONLY_CFG
+        # targets `*mlp*weight_quantizer`, which matches Qwen's `.mlp.experts`
+        # but NOT Nemotron's `.mixer.experts` - on the real model it quantized
+        # zero routed experts. The recipe names the modules explicitly, so its
+        # patterns are added as enable rules rather than trusting the stock
+        # config to reach the right place.
+        template_weight = _template_cfg(rules, "weight_quantizer")
+        template_input = _template_cfg(rules, "input_quantizer")
+        added = 0
+        for layer in recipe.quantized_layers:
+            pattern = str(layer["pattern"])
+            if str(layer.get("format", "")).lower() != "nvfp4" or template_weight is None:
+                continue
+            rules.append(
+                {
+                    "quantizer_name": _enable_pattern(pattern, "weight_quantizer"),
+                    "cfg": copy.deepcopy(template_weight),
+                }
+            )
+            added += 1
+            # Activation quantizers only where the recipe asks for W4A4 - this
+            # is the whole distinction between the two families.
+            if int(layer.get("activation_bits", 16)) == 4 and template_input is not None:
+                rules.append(
+                    {
+                        "quantizer_name": _enable_pattern(pattern, "input_quantizer"),
+                        "cfg": copy.deepcopy(template_input),
+                    }
+                )
+                added += 1
+        if added:
+            logger.info("%s: added %d enable rules from the recipe", recipe.family.value, added)
+        elif recipe.quantized_layers:
+            logger.warning(
+                "%s: no enable rules could be built - the stock config exposes no "
+                "reusable quantizer cfg. Quantization will follow the stock "
+                "config's own patterns, which may not match this architecture.",
+                recipe.family.value,
+            )
+
         adjusted = 0
         for rule in rules:
             block_sizes = (
