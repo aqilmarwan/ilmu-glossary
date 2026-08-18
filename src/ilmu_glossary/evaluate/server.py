@@ -155,7 +155,14 @@ def serve(
     requested = max_model_len or cfg.model.eval_max_model_len
     effective = _clamp_to_model_capacity(model_path, requested, cfg)
 
-    args = cfg.vllm.serve_args(
+    vllm_cfg = cfg.vllm
+    if cfg.dry_run and not vllm_cfg.enforce_eager:
+        # Graph capture is minutes of B200 time that a plumbing run does not
+        # need, and it hung outright on the proxy model.
+        vllm_cfg = vllm_cfg.model_copy(update={"enforce_eager": True, "max_num_seqs": 32})
+        logger.info("Dry run: serving eager with reduced concurrency")
+
+    args = vllm_cfg.serve_args(
         model_path,
         mamba_state=mamba_state,
         max_model_len=effective,

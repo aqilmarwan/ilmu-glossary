@@ -153,6 +153,12 @@ class VllmConfig(BaseModel):
     enable_prefix_caching: bool = True
     async_scheduling: bool = True
     port: int = 8000
+    # Skip torch.compile and CUDA graph capture. Startup on the dry-run proxy
+    # hung for 16 minutes in graph capture after compilation completed, which
+    # is pure cost for a run whose purpose is plumbing rather than
+    # performance. Throughput measured under eager is NOT representative, so
+    # tier 4e records the mode alongside its numbers.
+    enforce_eager: bool = False
 
     def serve_args(
         self,
@@ -188,6 +194,8 @@ class VllmConfig(BaseModel):
         ]
         if self.enable_prefix_caching:
             args.append("--enable-prefix-caching")
+        if self.enforce_eager:
+            args.append("--enforce-eager")
 
         if not hybrid_mamba:
             return args
