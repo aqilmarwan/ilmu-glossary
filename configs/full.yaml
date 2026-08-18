@@ -1,0 +1,234 @@
+# FULL-SCALE configuration - NVIDIA's own calibration settings.
+#
+# 1024 samples at 32,768 tokens, matching the 1,000 @ 32K NVIDIA used for the
+# shipped checkpoint. 5,000 parallel pairs, top-K 512. This is the
+# configuration whose results may be reported.
+#
+# configs/pilot.yaml exists only to de-risk the plumbing and its numbers must
+# not be quoted.
+
+# Routing-aware calibration study - default configuration.
+#
+# Every value here has a typed counterpart in src/ilmu_glossary/config.py.
+# This file exists so settings are visible and diffable; the code runs
+# without it using the same defaults.
+#
+# Deviations from routing-aware-calibration-spec.md are documented in
+# SPEC_DEVIATIONS.md with the evidence that motivated each one.
+
+seed: 42
+dry_run: false
+
+model:
+  # Resolved by web search on 2026-08-18. Re-validated at run time by
+  # ilmu_glossary.resolve.assert_model_resolves - the pipeline refuses to
+  # start if these stop resolving.
+  bf16_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  nvfp4_reference_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+  revision: main
+  resolved_on: 2026-08-18
+  trust_remote_code: true
+  fallback_bf16_repo: nvidia/Nemotron-3-Super-120B-A12B-BF16
+  # NVIDIA swept 8k-128k and chose 32,768 for Lightning. The spec's 65,536
+  # figure is a Nemotron 3 number and does not apply here.
+  calib_seq_len: 32768
+  eval_max_model_len: 65536
+
+data:
+  min_docs_per_class: 10000
+  min_dialect_docs: 2000
+  min_parallel_pairs: 5000
+  alignment_check_sample: 200
+  language_spotcheck_sample: 100
+  candidate_pool_size: 50000
+  train_fraction: 0.8
+  dedup_ngram: 13
+  dedup_threshold: 0.8
+  min_doc_chars: 200
+  max_records_per_source: 400000
+
+  sources:
+    formal_bm:
+      # Bare-JSONL repo: every line is a JSON *string*, not an object, and the
+      # 312 files do not share a schema - `datasets` inference fails with
+      # "'str' object is not a mapping". Read line by line from a pinned file
+      # list instead, which is also what makes the sample reproducible.
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        licence: unverified
+        data_files:
+          - utusan.jsonl
+          - sinarharian.jsonl
+          - bernama.com-tam.jsonl
+          - kosmo.jsonl
+          - mstar.com.my.jsonl
+          - agendadaily.jsonl
+          - amanz.jsonl
+        notes: Malaysian news and formal prose.
+
+    manglish:
+      # Lines are JSON arrays: [tag, manglish_text, {translations}].
+      - repo_id: mesolitica/chatgpt-noisy-translation-manglish
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: json_array
+        array_text_index: 1
+        provenance: malaysian
+        licence: unverified
+        data_files:
+          - filtered-manglish.jsonl
+          - process-manglish.jsonl
+        notes: >-
+          Colloquial Malaysian English / Manglish. Yield is low (~0.5% of
+          lines clear min_doc_chars) because social posts are short - see
+          the manglish note in README before the production run.
+
+    code_switched:
+      # Malaysian forums, filtered for within-sentence BM-EN alternation by
+      # data_prep.detect_intrasentential_switching (spec section 3.3).
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        licence: unverified
+        data_files:
+          - lowyat.jsonl
+          - c.cari.com.my.jsonl
+          - carigold.jsonl
+          - iium-confession.jsonl
+        notes: Forum text, the richest source of intra-sentential switching.
+
+    dialect:
+      # Optional class. Spec section 3.4 permits dropping it below 2,000 docs
+      # rather than padding with formal BM.
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        licence: unverified
+        data_files:
+          - b.cari.com.my.jsonl
+          - facebook.jsonl
+          - mycarforum.jsonl
+        notes: Filtered for Kelantanese/Kedahan/Sarawakian regional markers.
+
+    english_control:
+      - repo_id: HuggingFaceFW/fineweb-edu
+        kind: hf_dataset
+        config_name: sample-10BT
+        split: train
+        text_field: text
+        record_format: object
+        streaming: true
+        provenance: english
+        licence: ODC-By-1.0
+        notes: English of comparable formal/expository register.
+
+    code_control:
+      # bigcode/the-stack-smol is GATED (verified 2026-08-18) and would stall
+      # phase 0 waiting on a licence click.
+      - repo_id: codeparrot/codeparrot-clean-valid
+        kind: hf_dataset
+        split: train
+        text_field: content
+        record_format: object
+        streaming: true
+        provenance: code
+        licence: multiple-see-upstream
+        notes: >-
+          Source code control class. Swap to bigcode/the-stack-smol if you
+          accept its licence on the Hub - it is the better corpus, just gated.
+
+    parallel_bm_en:
+      # Instruction format: `<source>` terjemah ke melayu -> output is Malay.
+      # The target language named in the instruction decides which side is
+      # which; reading (input, output) as (ms, en) gets it backwards.
+      - repo_id: mesolitica/noisy-standard-malay-translation-instructions
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: instruction_pair
+        provenance: mixed
+        licence: unverified
+        data_files:
+          - lowyat-instructions.jsonl
+          - b.cari.com.my-instructions.jsonl
+          - c.cari.com.my-instructions.jsonl
+          - facebook-instructions.jsonl
+          - iium-confession-instructions.jsonl
+        notes: >-
+          Aligned BM/EN pairs. Substrate for the primary metric - content,
+          topic and difficulty held constant so divergence is attributable
+          to language alone. Alignment verified on 200 random pairs.
+
+lid:
+  primary_model: mesolitica/fasttext-language-detection-v2
+  ms_id_model: mesolitica/fasttext-language-detection-ms-id
+  quantized: true
+  min_malay_prob: 0.70
+  max_indonesian_prob: 0.20
+  min_english_prob: 0.80
+  max_indonesian_marker_ratio: 0.02
+
+calibration:
+  sample_counts: [256, 512, 1024, 2048]
+  gate_variant: oracle_contaminated
+  gate_sample_count: 1024
+  gate_min_relative_headroom: 0.10
+  # Stated assumption, not a measurement. Spec section 5 requires it be
+  # documented as such wherever mixed_weighted appears.
+  assumed_traffic_mix:
+    formal_bm: 0.25
+    manglish: 0.30
+    code_switched: 0.20
+    english_control: 0.20
+    code_control: 0.05
+  greedy_candidate_cap: 4000
+  greedy_lazy_queue: true
+  greedy_tiebreak_percentile: 10.0
+
+quant:
+  families: [w4a16_shipped, w4a4_mechanism]
+  recipe_dir: recipes
+  upstream_recipe_path: >-
+    modelopt_recipes/huggingface/models/nvidia/Nemotron-3.5-Lightning-30B-A3B-BF16/ptq/w4a16_nvfp4_4o6.yaml
+  upstream_repo: https://github.com/NVIDIA/Model-Optimizer
+  calib_batch_size: 1
+  mamba_state_arms: [float32, float16_stochastic_rounding]
+
+eval:
+  kl_top_k: 512
+  kl_max_pairs: 5000
+  kl_max_tokens_per_side: 4096
+  ppl_max_docs_per_class: 2000
+  ppl_stride: 2048
+  cross_mmlu_repo: SeaEval/SeaEval_datasets
+  cross_mmlu_config: cross_mmlu
+  cross_mmlu_languages: [english, malay, indonesian, chinese]
+  malay_mmlu_repo: UMxYTLAILabs/MalayMMLU
+  malay_mmlu_files: [MalayMMLU_0shot.json]
+  malay_mmlu_shots: 0
+  throughput_concurrencies: [1, 8, 32, 64]
+  throughput_input_tokens: 2048
+  throughput_output_tokens: 256
+  bootstrap_resamples: 1000
+  confidence_level: 0.95
+
+paths:
+  root: /vol/full
+
+modal:
+  app_name: ilmu-glossary
+  volume_name: ilmu-glossary-vol
+  hf_cache_volume: ilmu-glossary-hf-cache
+  gpu: B200
+  gpu_count: 1
+
+tracking:
+  enabled: true
+  experiment_name: routing-aware-calibration-full
+  tracking_uri: file:///vol/full/mlruns
