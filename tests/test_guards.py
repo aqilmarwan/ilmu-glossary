@@ -713,3 +713,41 @@ class TestStagedPipeline:
         """A null result still needs its report written."""
         journal, _ = self._run(tmp_path, oracle_delta=0.039)
         assert "phase5" in journal["stages"]
+
+
+@pytest.mark.network
+class TestLidLabelsMatchModels:
+    """The label constants must cover what the models actually emit.
+
+    An unrecognised label does not raise - it falls through to "other" and the
+    document is dropped. That is how `english_control` came out with 0 of
+    20,000 records on the first dry run: the code looked for `eng` while v2
+    emits `standard-english`. The model cards are unreliable here (v2's omits
+    `manglish`, `standard-indonesian` and both mandarin labels), so this reads
+    the labels from the model files themselves.
+    """
+
+    REPOS = (
+        "mesolitica/fasttext-language-detection-v1",
+        "mesolitica/fasttext-language-detection-v2",
+        "mesolitica/fasttext-language-detection-ms-id",
+    )
+
+    def test_every_emitted_label_is_known(self) -> None:
+        fasttext = pytest.importorskip("fasttext")
+        from huggingface_hub import hf_hub_download
+
+        from ilmu_glossary.lid import KNOWN_LABELS
+
+        unknown: dict[str, set[str]] = {}
+        for repo in self.REPOS:
+            path = hf_hub_download(repo, "fasttext.ftz")
+            labels = {label.removeprefix("__label__") for label in fasttext.load_model(path).labels}
+            missing = labels - KNOWN_LABELS
+            if missing:
+                unknown[repo] = missing
+
+        assert not unknown, (
+            f"LID models emit labels the pipeline does not recognise: {unknown}. "
+            "Documents carrying them are silently dropped."
+        )

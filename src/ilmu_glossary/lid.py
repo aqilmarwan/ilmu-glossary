@@ -36,10 +36,37 @@ from ilmu_glossary.config import LidConfig
 
 logger = logging.getLogger(__name__)
 
-# Labels mesolitica's v2 model emits. Mapped to the study's decision space.
-MALAY_LABELS = frozenset({"standard-malay", "local-malay", "malay", "manglish", "rojak"})
-INDONESIAN_LABELS = frozenset({"standard-indonesian", "socialmedia-indonesian", "ind"})
-ENGLISH_LABELS = frozenset({"eng", "english"})
+# Label sets, read directly from the models with `fasttext.load_model(...).labels`
+# on 2026-08-18 rather than from the model cards, which are incomplete - the v2
+# card omits `manglish`, `standard-indonesian` and both mandarin labels.
+#
+#   v1     eng, ind, malay, manglish, other, rojak
+#   v2     local-english, local-malay, local-mandarin, manglish, other,
+#          socialmedia-indonesian, standard-english, standard-indonesian,
+#          standard-malay, standard-mandarin
+#   ms-id  local-malay, other, socialmedia-indonesian, standard-indonesian,
+#          standard-malay
+#
+# The union is covered so the same code works against any of the three.
+# `tests/test_guards.py::TestLanguageID::test_label_sets_match_models` asserts
+# these stay in sync - an unrecognised label silently rejects every document,
+# which is exactly how english_control came out empty on the first dry run.
+MALAY_LABELS = frozenset({"malay", "standard-malay", "local-malay"})
+MANGLISH_LABELS = frozenset({"manglish", "local-english"})
+ROJAK_LABELS = frozenset({"rojak"})
+INDONESIAN_LABELS = frozenset({"ind", "standard-indonesian", "socialmedia-indonesian"})
+ENGLISH_LABELS = frozenset({"eng", "english", "standard-english"})
+OTHER_LABELS = frozenset({"other", "standard-mandarin", "local-mandarin"})
+
+# Every label the pipeline knows how to act on.
+KNOWN_LABELS = (
+    MALAY_LABELS
+    | MANGLISH_LABELS
+    | ROJAK_LABELS
+    | INDONESIAN_LABELS
+    | ENGLISH_LABELS
+    | OTHER_LABELS
+)
 
 Verdict = Literal["malay", "indonesian", "english", "manglish", "rojak", "other", "unknown"]
 
@@ -84,7 +111,9 @@ class LidResult:
 
 
 class _FastTextModel(Protocol):
-    def predict(self, text: str, k: int) -> tuple[list[str], Any]: ...
+    """Either the numpy wrapper or the raw C predictor - see `_predict_probs`."""
+
+    def predict(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 # --------------------------------------------------------------------------
@@ -164,16 +193,49 @@ def _normalise(text: str) -> str:
     return " ".join(text.split())[:2000]
 
 
-def _predict_probs(model: _FastTextModel | None, text: str) -> dict[str, float]:
+def _predict_probs(model: Any, text: str, *, k: int = 10) -> dict[str, float]:
+    """Label -> probability for one document.
+
+    Calls the underlying C predictor rather than `model.predict`. fastText
+    0.9.2's Python wrapper ends with `np.array(probs, copy=False)`, which
+    NumPy 2 rejects outright ("Unable to avoid copy while creating an array
+    as requested"). The wrapper therefore raises for *every* input, and
+    because the failure was caught and logged at debug level it presented as
+    a silent, total classification failure - every document came back
+    "unknown" and every corpus class emptied.
+
+    The C API returns [(prob, "__label__x"), ...] and is unaffected.
+    """
     if model is None:
         return {}
+    normalised = _normalise(text)
+    if not normalised:
+        return {}
+
+    raw: Any = None
+    predictor = getattr(model, "f", None)
+    if predictor is not None:
+        try:
+            raw = predictor.predict(normalised, k, 0.0, "strict")
+        except Exception as exc:
+            logger.debug("fastText C predict failed: %r", exc)
+            raw = None
+
+    if raw is not None:
+        return {str(label).removeprefix("__label__"): float(prob) for prob, label in raw}
+
+    # Fall back to the numpy wrapper for builds that expose no `.f`.
     try:
-        labels, probs = model.predict(_normalise(text), k=10)
+        labels, probs = model.predict(normalised, k=k)
     except Exception as exc:
-        logger.debug("fastText predict failed: %r", exc)
+        logger.warning(
+            "fastText prediction failed (%r). LID is producing no signal; "
+            "every document will be classified 'unknown'.",
+            exc,
+        )
         return {}
     return {
-        label.removeprefix("__label__"): float(prob)
+        str(label).removeprefix("__label__"): float(prob)
         for label, prob in zip(labels, probs, strict=False)
     }
 
@@ -224,7 +286,10 @@ class LanguageIdentifier:
             if label in MALAY_LABELS or label in INDONESIAN_LABELS:
                 merged[label] = max(merged.get(label, 0.0), prob)
 
-        malay_p = _aggregate(merged, MALAY_LABELS)
+        # Malaysian-origin mass: plain Malay plus its colloquial registers.
+        # `accepted_as_malay` admits manglish and rojak, so the threshold that
+        # gates it has to be computed over the same set.
+        malay_p = _aggregate(merged, MALAY_LABELS | MANGLISH_LABELS | ROJAK_LABELS)
         indo_p = _aggregate(merged, INDONESIAN_LABELS)
         eng_p = _aggregate(merged, ENGLISH_LABELS)
         top_label = max(merged, key=lambda k: merged[k]) if merged else "unknown"
@@ -233,11 +298,11 @@ class LanguageIdentifier:
         rejected_by: str | None = None
 
         if merged:
-            if top_label in ENGLISH_LABELS and eng_p >= cfg.min_english_prob:
-                verdict = "english"
-            elif top_label == "manglish":
+            if top_label in ENGLISH_LABELS:
+                verdict = "english" if eng_p >= cfg.min_english_prob else "other"
+            elif top_label in MANGLISH_LABELS:
                 verdict = "manglish"
-            elif top_label == "rojak":
+            elif top_label in ROJAK_LABELS:
                 verdict = "rojak"
             elif top_label in INDONESIAN_LABELS:
                 verdict = "indonesian"
@@ -245,6 +310,12 @@ class LanguageIdentifier:
                 verdict = "malay"
             else:
                 verdict = "other"
+            if top_label not in KNOWN_LABELS:
+                logger.warning(
+                    "Unrecognised LID label %r - it will be treated as 'other' and "
+                    "its documents dropped. Add it to a label set in lid.py.",
+                    top_label,
+                )
 
         # Layer 2 thresholds.
         if verdict in {"malay", "manglish", "rojak"}:
@@ -479,7 +550,11 @@ __all__ = [
     "DIALECT_MARKERS",
     "ENGLISH_LABELS",
     "INDONESIAN_LABELS",
+    "KNOWN_LABELS",
     "MALAY_LABELS",
+    "MANGLISH_LABELS",
+    "OTHER_LABELS",
+    "ROJAK_LABELS",
     "LanguageIdentifier",
     "LidResult",
     "Verdict",

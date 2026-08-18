@@ -81,7 +81,7 @@ gpu_image = (
     )
     .pip_install(
         f"vllm=={VLLM_VERSION}",
-        f"nvidia-modelopt[torch]=={MODELOPT_VERSION}",
+        f"nvidia-modelopt=={MODELOPT_VERSION}",
         "accelerate>=1.2",
         "flashinfer-python>=0.2",
     )

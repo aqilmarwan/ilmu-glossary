@@ -353,13 +353,25 @@ def classify_document(
     if result.verdict not in {"malay", "manglish", "rojak"}:
         return ClassificationOutcome(None, f"verdict_{result.verdict}", result.to_dict())
 
-    # Manglish: the LID model has a dedicated label for it and is more
-    # reliable than any heuristic we would write.
-    if result.verdict == "manglish":
-        return ClassificationOutcome(CorpusClass.MANGLISH, "lid_manglish", result.to_dict())
-
     is_switched, switch_ratio = detect_intrasentential_switching(text)
     evidence = {**result.to_dict(), "switch_ratio": switch_ratio}
+
+    # Manglish vs code-switched. The LID has a dedicated `manglish` label and
+    # is more reliable than any heuristic, but it fires on both registers, and
+    # taking it unconditionally starves code_switched (measured: 100 manglish
+    # to 1 code_switched on Malaysian forum text).
+    #
+    # Spec section 3.3 wants BM-English interleaved *within* sentences.
+    # detect_intrasentential_switching requires both an English and a Malay
+    # function word in the same sentence, so English-base Manglish carrying
+    # only particles ("the food damn nice lah") does not trigger it, while
+    # genuinely interleaved text does.
+    if result.verdict == "manglish":
+        if is_switched:
+            return ClassificationOutcome(
+                CorpusClass.CODE_SWITCHED, "lid_manglish_intrasentential", evidence
+            )
+        return ClassificationOutcome(CorpusClass.MANGLISH, "lid_manglish", evidence)
 
     # `rojak` is mesolitica's label for mixed-language text. Confirm the mixing
     # is intra-sentential before admitting it, since spec section 3.3 excludes
