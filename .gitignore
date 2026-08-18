@@ -1,0 +1,29 @@
+# data and artifacts never enter git - they live on the Modal Volume
+data/
+results/
+mlruns/
+checkpoints/
+*.parquet
+*.jsonl
+*.bin
+*.safetensors
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# os
+.DS_Store

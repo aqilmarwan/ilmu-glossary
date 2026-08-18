@@ -1,0 +1,111 @@
+[project]
+name = "ilmu-glossary"
+version = "0.1.0"
+description = "Routing-aware quantization calibration for Bahasa Melayu on hybrid Mamba-MoE models"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Aqil Marwan Azhar" }]
+
+# Host-side dependencies only. Everything CUDA-bound (torch, vllm, modelopt,
+# flashinfer) is installed inside the Modal image, never on the laptop -
+# see modal_app/images.py. Keeping them out of this table is what lets
+# `uv sync` work on macOS.
+dependencies = [
+  "modal>=1.0",
+  "pydantic>=2.9",
+  "pyyaml>=6.0",
+  "typer>=0.15",
+  "rich>=13.9",
+  "pandas>=2.2",
+  "pyarrow>=18.0",
+  "numpy>=2.1",
+  "scipy>=1.14",
+  "datasets>=3.2",
+  "huggingface-hub>=0.27",
+  "transformers>=4.48",
+  "mlflow>=2.19",
+  "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+# Installed inside the Modal GPU image. Listed here so the versions live in
+# one place and images.py can read them, but never resolved on macOS.
+gpu = [
+  "torch>=2.9",
+  "vllm>=0.27.1",
+  "nvidia-modelopt[torch]>=0.40",
+  "accelerate>=1.2",
+  "flashinfer-python>=0.2",
+  "aiperf>=0.1",
+]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.9",
+  "mypy>=1.14",
+  "types-pyyaml",
+  "pandas-stubs",
+]
+
+[project.scripts]
+ilmu = "ilmu_glossary.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ilmu_glossary"]
+
+[tool.uv]
+# torch/vllm wheels are pulled from the CUDA index inside the Modal image,
+# not here. Nothing in the default dependency set needs an extra index.
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",      # pycodestyle + pyflakes
+  "I",                # isort
+  "B",                # bugbear
+  "UP",               # pyupgrade
+  "SIM",              # simplify
+  "RUF",
+  "N",                # pep8-naming
+  "PTH",              # use pathlib
+  "ARG",              # unused arguments
+]
+ignore = [
+  "E501",   # line length handled by formatter
+  "B008",   # typer uses function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+# GPU-only libs are absent on the host; do not fail type-checking on them.
+[[tool.mypy.overrides]]
+module = [
+  "torch.*", "vllm.*", "modelopt.*", "transformers.*", "datasets.*",
+  "fasttext.*", "mlflow.*", "modal.*", "scipy.*", "accelerate.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+  "gpu: requires CUDA, skipped on the host",
+  "network: hits the network / HuggingFace Hub",
+  "slow: long-running",
+]

@@ -1,0 +1,106 @@
+"""Modal container images.
+
+Two images, because the CPU phases must not wait on a multi-gigabyte CUDA
+image and the GPU phases must not resolve torch on the laptop.
+
+  cpu_image  - phase 0 (streaming ingest, LID, stratification) and phase 5
+  gpu_image  - phases 1, 3, 4 (routing capture, PTQ, vLLM evaluation)
+
+Version pins live in pyproject.toml's `gpu` extra and are mirrored here.
+Keep the two in sync; `tests/test_images.py` asserts they match.
+"""
+
+from __future__ import annotations
+
+import modal
+
+PYTHON_VERSION = "3.12"
+
+# vLLM 0.27.1 is the floor for the hybrid Mamba-2 serving path that
+# Nemotron 3.5 Lightning requires. NVFP4 tensor cores additionally require
+# Blackwell SM100+; the image will build on any host but the kernels only
+# exist on B200/B300/GB200.
+VLLM_VERSION = "0.27.1"
+TORCH_VERSION = "2.9.0"
+MODELOPT_VERSION = "0.40.0"
+CUDA_TAG = "12.8.1"
+
+_HOST_DEPS = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "typer>=0.15",
+    "rich>=13.9",
+    "pandas>=2.2",
+    "pyarrow>=18.0",
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "datasets>=3.2",
+    "huggingface-hub[hf_transfer]>=0.27",
+    "transformers>=4.48",
+    "mlflow>=2.19",
+    "tqdm>=4.67",
+]
+
+_ENV = {
+    # Streaming the 349 GB Malaysian corpus is bandwidth-bound; hf_transfer
+    # roughly triples throughput on Modal's network.
+    "HF_HUB_ENABLE_HF_TRANSFER": "1",
+    "HF_HOME": "/hf-cache",
+    "TOKENIZERS_PARALLELISM": "false",
+    "PYTHONUNBUFFERED": "1",
+}
+
+
+cpu_image = (
+    modal.Image.debian_slim(python_version=PYTHON_VERSION)
+    .apt_install("git", "build-essential")
+    .pip_install(*_HOST_DEPS)
+    # fastText wheels are unreliable on 3.12; build from the pinned source.
+    .pip_install("fasttext-wheel>=0.9.2")
+    .env(_ENV)
+    .add_local_python_source("ilmu_glossary")
+)
+
+
+gpu_image = (
+    modal.Image.from_registry(
+        f"nvidia/cuda:{CUDA_TAG}-devel-ubuntu22.04",
+        add_python=PYTHON_VERSION,
+    )
+    .apt_install("git", "build-essential", "libopenmpi-dev")
+    .pip_install(*_HOST_DEPS)
+    .pip_install(
+        f"torch=={TORCH_VERSION}",
+        index_url="https://download.pytorch.org/whl/cu128",
+    )
+    .pip_install(
+        f"vllm=={VLLM_VERSION}",
+        f"nvidia-modelopt[torch]=={MODELOPT_VERSION}",
+        "accelerate>=1.2",
+        "flashinfer-python>=0.2",
+    )
+    # NVIDIA AIPerf drives tier 4e. It replaces genai-perf and speaks the
+    # OpenAI-compatible endpoint vLLM exposes.
+    .pip_install("aiperf>=0.1")
+    .env(
+        {
+            **_ENV,
+            # NVFP4 kernels are Blackwell-only. Building for SM100 keeps the
+            # image from silently falling back to W4A16 Marlin paths.
+            "TORCH_CUDA_ARCH_LIST": "10.0",
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        }
+    )
+    .add_local_python_source("ilmu_glossary")
+)
+
+
+__all__ = [
+    "CUDA_TAG",
+    "MODELOPT_VERSION",
+    "PYTHON_VERSION",
+    "TORCH_VERSION",
+    "VLLM_VERSION",
+    "cpu_image",
+    "gpu_image",
+]
