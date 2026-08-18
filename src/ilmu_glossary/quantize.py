@@ -88,6 +88,21 @@ class Recipe:
         )
 
     @property
+    def group_size(self) -> int | None:
+        """NVFP4 block size the recipe specifies for routed experts.
+
+        NVIDIA's shipped checkpoint uses 16; ModelOpt's stock NVFP4 configs
+        default to 32. Left alone, the study would quantize at a different
+        block size than the checkpoint it claims to reproduce.
+        """
+        for layer in self.payload.get("quantization", {}).get("layers", []):
+            pattern = str(layer.get("pattern", ""))
+            if "experts" in pattern and "shared" not in pattern:
+                size = layer.get("group_size") or layer.get("block_size")
+                return int(size) if size is not None else None
+        return None
+
+    @property
     def expert_activation_bits(self) -> int | None:
         """Activation bit width on routed experts.
 
@@ -364,27 +379,62 @@ def _glob_to_quantizer_pattern(pattern: str) -> str:
 
 
 def build_quant_config(recipe: Recipe) -> dict[str, Any]:
-    """Stock ModelOpt config with the recipe's exclusions applied.
+    """Stock ModelOpt config with the recipe's exclusions and block size applied.
 
-    The recipe used to be inert: only `expert_activation_bits` was read, and
-    the `exclude` list - attention, conv1d, routers, embeddings, mtp heads -
-    never reached ModelOpt at all. The stock NVFP4_DEFAULT_CFG quantizes
-    attention, contradicting both recipes, and nothing prevented a router from
-    being quantized.
+    The recipe used to be inert: only `expert_activation_bits` was read, so the
+    `exclude` list - attention, conv1d, routers, embeddings, mtp heads - never
+    reached ModelOpt. The stock NVFP4_DEFAULT_CFG quantizes attention,
+    contradicting both recipes, and nothing prevented a router being quantized.
 
-    Later keys win in ModelOpt's matching, so disabling entries are appended
-    after the stock rules.
+    In nvidia-modelopt 0.45 `quant_cfg` is an **ordered list** of rules shaped
+    `{"quantizer_name": glob, "enable": bool}` or `{"quantizer_name": glob,
+    "cfg": {...}}`, not a mapping - the first rule disables everything and
+    later rules re-enable specifics, so later wins and exclusions are appended
+    last. A dict form is handled too, for older releases.
     """
     import copy
 
     stock = _resolve_quant_config(recipe)
     config: dict[str, Any] = copy.deepcopy(dict(stock))
-    quant_cfg: dict[str, Any] = dict(config.get("quant_cfg", {}))
+    rules = config.get("quant_cfg")
+    group_size = recipe.group_size
 
-    for pattern in recipe.exclude_patterns:
-        quant_cfg[_glob_to_quantizer_pattern(pattern)] = {"enable": False}
+    if isinstance(rules, list):
+        adjusted = 0
+        for rule in rules:
+            block_sizes = (
+                (rule.get("cfg") or {}).get("block_sizes") if isinstance(rule, dict) else None
+            )
+            if (
+                isinstance(block_sizes, dict)
+                and -1 in block_sizes
+                and group_size
+                and block_sizes[-1] != group_size
+            ):
+                block_sizes[-1] = group_size
+                adjusted += 1
+        if adjusted:
+            logger.info(
+                "%s: set NVFP4 block size to %d on %d rules (stock default differs "
+                "from the shipped checkpoint's group_size)",
+                recipe.family.value,
+                group_size,
+                adjusted,
+            )
+        rules.extend(
+            {"quantizer_name": _glob_to_quantizer_pattern(p), "enable": False}
+            for p in recipe.exclude_patterns
+        )
+    elif isinstance(rules, dict):
+        for pattern in recipe.exclude_patterns:
+            rules[_glob_to_quantizer_pattern(pattern)] = {"enable": False}
+    else:
+        raise RecipeMismatchError(
+            f"Unrecognised ModelOpt quant_cfg type {type(rules).__name__}. The "
+            "recipe's exclusions cannot be applied, so routers might be "
+            "quantized - refusing to proceed rather than silently ignoring them."
+        )
 
-    config["quant_cfg"] = quant_cfg
     logger.info(
         "%s: applied %d exclusion patterns (%d naming routers)",
         recipe.family.value,

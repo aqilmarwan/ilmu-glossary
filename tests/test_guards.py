@@ -1317,3 +1317,63 @@ class TestReportSurfacesNewTiers:
 
         frame = pd.DataFrame([{"corpus_class": "formal_bm", "perplexity": 24.0}])
         assert "Absolute perplexity only" in build_report(Config(), Artifacts(ppl=frame))
+
+
+class TestQuantConfigListForm:
+    """nvidia-modelopt 0.45 stores quant_cfg as an ORDERED LIST of
+    {'quantizer_name': glob, 'enable'/'cfg': ...} rules, not a mapping. The
+    first rule disables everything and later rules re-enable specifics, so
+    later wins. Treating it as a mapping raised
+    'dictionary update sequence element has length 3'."""
+
+    @staticmethod
+    def _stock() -> dict:  # type: ignore[type-arg]
+        return {
+            "quant_cfg": [
+                {"quantizer_name": "*", "enable": False},
+                {
+                    "quantizer_name": "*mlp*weight_quantizer",
+                    "cfg": {"num_bits": (2, 1), "block_sizes": {-1: 32, "type": "dynamic"}},
+                },
+            ],
+            "algorithm": "max",
+        }
+
+    def _build(self, monkeypatch, family: RecipeFamily):  # type: ignore[no-untyped-def]
+        import ilmu_glossary.quantize as q
+
+        stock = self._stock()
+        monkeypatch.setattr(q, "_resolve_quant_config", lambda _r: stock)
+        recipe = q.load_recipe(Config(), family)
+        return q.build_quant_config(recipe), recipe, stock
+
+    def test_exclusions_appended_last_so_they_win(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        built, recipe, _ = self._build(monkeypatch, RecipeFamily.W4A16_SHIPPED)
+        rules = built["quant_cfg"]
+        assert len(rules) == 2 + len(recipe.exclude_patterns)
+        tail = rules[2:]
+        assert all(r["enable"] is False for r in tail)
+        assert any("gate" in r["quantizer_name"] for r in tail), "router must be excluded"
+
+    def test_block_size_follows_the_recipe(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """NVIDIA ships group_size 16; ModelOpt's stock NVFP4 default is 32.
+        Left alone the study quantizes at a different block size than the
+        checkpoint it claims to reproduce."""
+        built, recipe, _ = self._build(monkeypatch, RecipeFamily.W4A16_SHIPPED)
+        assert recipe.group_size == 16
+        assert built["quant_cfg"][1]["cfg"]["block_sizes"][-1] == 16
+
+    def test_stock_config_is_not_mutated(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """mtq's module-level configs are shared; mutating one would leak into
+        every later run in the process."""
+        _, _, stock = self._build(monkeypatch, RecipeFamily.W4A16_SHIPPED)
+        assert stock["quant_cfg"][1]["cfg"]["block_sizes"][-1] == 32
+        assert len(stock["quant_cfg"]) == 2
+
+    def test_unknown_shape_refuses_rather_than_ignoring(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        import ilmu_glossary.quantize as q
+
+        monkeypatch.setattr(q, "_resolve_quant_config", lambda _r: {"quant_cfg": "surprise"})
+        recipe = q.load_recipe(Config(), RecipeFamily.W4A16_SHIPPED)
+        with pytest.raises(q.RecipeMismatchError, match="Unrecognised"):
+            q.build_quant_config(recipe)
