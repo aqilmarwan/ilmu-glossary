@@ -50,6 +50,13 @@ REFERENCE_CHECKPOINT = "bf16_reference"
 
 def resolve_checkpoint_path(cfg: Config, checkpoint: str) -> str:
     """Map a checkpoint label to a servable path or repo id."""
+    if cfg.dry_run:
+        # Every dry-run checkpoint resolves to the same small dense model, so
+        # tier 1 compares it against itself. KL(model || itself) must come out
+        # at ~0 and the BM-EN delta with it - a real correctness check on the
+        # estimator, which a genuine quantized comparison could not provide
+        # this cheaply.
+        return cfg.dry_run_eval_model
     if checkpoint == REFERENCE_CHECKPOINT:
         return cfg.effective_model_repo()
     if checkpoint == "nvfp4_shipped":

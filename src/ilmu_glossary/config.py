@@ -585,6 +585,13 @@ class Config(BaseModel):
     dry_run: bool = False
     # Tiny-model, tiny-N mode that exercises every phase for a few dollars.
     dry_run_model: str = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
+    # Phase 4 is model-agnostic: it exercises server lifecycle, top-K logprob
+    # capture, the KL estimator, perplexity and the MMLU scorers, none of which
+    # care whether the model is an MoE. Serving the MoE proxy hung in vLLM's
+    # FlashInfer MoE path, which is incidental to this study since Nemotron
+    # serves through a different backend, so the dry run validates that logic
+    # against a small dense model instead.
+    dry_run_eval_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     dry_run_sample_counts: tuple[int, ...] = (8, 16)
     dry_run_seq_len: int = 1_024
 
