@@ -1348,12 +1348,17 @@ class TestQuantConfigListForm:
         return q.build_quant_config(recipe), recipe, stock
 
     def test_exclusions_appended_last_so_they_win(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """Later rules override earlier ones, so the disabling entries must be
+        the final block - after the recipe's own enable rules."""
         built, recipe, _ = self._build(monkeypatch, RecipeFamily.W4A16_SHIPPED)
         rules = built["quant_cfg"]
-        assert len(rules) == 2 + len(recipe.exclude_patterns)
-        tail = rules[2:]
-        assert all(r["enable"] is False for r in tail)
+        tail = rules[-len(recipe.exclude_patterns) :]
+        assert all(r.get("enable") is False for r in tail)
         assert any("gate" in r["quantizer_name"] for r in tail), "router must be excluded"
+        # Enable rules for the routed experts sit before them.
+        enables = [r for r in rules if "cfg" in r and "experts" in r["quantizer_name"]]
+        assert enables, "recipe must contribute expert enable rules"
+        assert rules.index(enables[-1]) < len(rules) - len(recipe.exclude_patterns)
 
     def test_block_size_follows_the_recipe(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
         """NVIDIA ships group_size 16; ModelOpt's stock NVFP4 default is 32.
