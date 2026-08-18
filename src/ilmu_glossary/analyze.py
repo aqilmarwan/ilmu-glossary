@@ -433,12 +433,28 @@ def build_report(cfg: Config, artifacts: Artifacts) -> str:
             f"routing frequency: **{_fmt(expert_stats.get('malay_english_routing_spearman'))}** "
             f"(p = {_fmt(expert_stats.get('malay_english_routing_p'))})\n"
         )
-        add(
-            "\nA low Malay-English routing correlation combined with "
-            "non-trivial Malay mass on English-starved experts is the "
-            "mechanism the study set out to test: those experts receive little "
-            "or no calibration coverage under an English-only set.\n"
-        )
+        starved = int(expert_stats.get("n_english_starved_experts", 0) or 0)
+        mass = float(expert_stats.get("malay_mass_on_starved_experts", 0.0) or 0.0)
+        if starved and mass > 0:
+            add(
+                "\nA low Malay-English routing correlation combined with "
+                f"{_fmt(mass)} of Malay's routing mass on {starved} experts "
+                "English effectively never reaches is the mechanism the study "
+                "set out to test: those experts receive little or no "
+                "calibration coverage under an English-only set.\n"
+            )
+        else:
+            add(
+                "\n**The starvation mechanism is not present in these data.** "
+                "Every expert Malay routes to also receives English traffic, so "
+                "an English-only calibration set does reach them. Whatever "
+                "difference the routing distributions show, it is not the "
+                "'experts Malay depends on see no calibration tokens' effect "
+                "spec section 0 describes, and any recovery from recalibration "
+                "must be explained by a different mechanism - most plausibly "
+                "the *relative* token counts each expert receives rather than "
+                "their presence or absence.\n"
+            )
         add("\n### Per-expert routing preference (top 30 by Malay preference)\n")
         add(
             _markdown_table(

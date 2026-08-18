@@ -1085,3 +1085,55 @@ class TestAiperfParsing:
         from ilmu_glossary.evaluate.throughput import _parse_aiperf_output
 
         assert _parse_aiperf_output(tmp_path) is None
+
+
+class TestReportDoesNotAssertAbsentMechanisms:
+    """Spec section 8 requires a null stated plainly. Section 4's narrative
+    once claimed the starvation mechanism regardless of what the numbers said,
+    including when zero experts were starved."""
+
+    @staticmethod
+    def _profiles(malay_only_experts: bool):  # type: ignore[no-untyped-def]
+        import pandas as pd
+
+        rows = []
+        for i in range(20):
+            rows.append(
+                {
+                    "doc_id": f"bm{i}",
+                    "corpus_class": "formal_bm",
+                    "layer_index": 0,
+                    "expert_id": i % 4,
+                    "token_count": 50,
+                }
+            )
+        # English either shares every expert, or avoids two of them entirely.
+        english_experts = [0, 1] if malay_only_experts else [0, 1, 2, 3]
+        for i in range(20):
+            rows.append(
+                {
+                    "doc_id": f"en{i}",
+                    "corpus_class": "english_control",
+                    "layer_index": 0,
+                    "expert_id": english_experts[i % len(english_experts)],
+                    "token_count": 50,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_absence_of_starvation_is_stated_plainly(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        report = build_report(
+            Config(), Artifacts(per_document_profiles=self._profiles(malay_only_experts=False))
+        )
+        assert "starvation mechanism is not present" in report
+        assert "is the mechanism the study set out to test" not in report
+
+    def test_presence_of_starvation_is_reported(self) -> None:
+        from ilmu_glossary.analyze import Artifacts, build_report
+
+        report = build_report(
+            Config(), Artifacts(per_document_profiles=self._profiles(malay_only_experts=True))
+        )
+        assert "is the mechanism the study set out to test" in report
