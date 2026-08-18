@@ -279,32 +279,49 @@ class QuantizationRun:
         }
 
 
+# ModelOpt config names by expert activation width, most preferred first.
+# Verified against nvidia-modelopt 0.40.0 by enumerating `dir(mtq)` inside the
+# GPU image - the names in NVIDIA's blog posts (W4A16_NVFP4_CFG) do not exist
+# in the installed package.
+_QUANT_CONFIG_PREFERENCE: dict[int, tuple[str, ...]] = {
+    # Weight-only NVFP4: the shipped Lightning configuration. For an MoE the
+    # experts *are* the MLP, so the MLP-scoped config is what reaches them.
+    16: ("NVFP4_MLP_WEIGHT_ONLY_CFG", "NVFP4_MLP_ONLY_CFG"),
+    # W4A4 NVFP4: weights and activations, so per-tensor amax estimation
+    # genuinely occurs on the experts. This is the mechanism family.
+    4: ("NVFP4_DEFAULT_CFG", "NVFP4_AFFINE_KV_CFG"),
+}
+
+
 def _resolve_quant_config(recipe: Recipe) -> Any:
     """Map a recipe to a ModelOpt quantization config.
 
-    ModelOpt ships named configs; the recipe's expert activation width and
-    algorithm select among them. Falling back to a wrong config silently
-    would invalidate the family distinction, so an unrecognised combination
-    raises.
+    Falling back to a wrong config silently would collapse the two families
+    into one and make the whole mechanism contrast vacuous, so an
+    unresolvable width raises and names what the installed package offers.
     """
     import modelopt.torch.quantization as mtq
 
     bits = recipe.expert_activation_bits
-    if bits == 16:
-        # Weight-only NVFP4 - the shipped Lightning configuration.
-        return mtq.W4A16_NVFP4_CFG
-    if bits == 4:
-        # W4A4 NVFP4 - activation scales exist and are amax-calibrated.
-        for name in ("NVFP4_DEFAULT_CFG", "NVFP4_CFG", "W4A4_NVFP4_CFG"):
-            config = getattr(mtq, name, None)
-            if config is not None:
-                return config
-        raise RuntimeError(
-            "No W4A4 NVFP4 config found in this ModelOpt version. The "
-            "w4a4_mechanism family cannot run; either pin a ModelOpt release "
-            "that exposes one or drop the family and record the omission."
-        )
-    raise ValueError(f"Unsupported expert activation width: {bits}")
+    candidates = _QUANT_CONFIG_PREFERENCE.get(bits or -1)
+    if candidates is None:
+        raise ValueError(f"Unsupported expert activation width: {bits}")
+
+    for name in candidates:
+        config = getattr(mtq, name, None)
+        if config is not None:
+            logger.info("%s -> mtq.%s", recipe.family.value, name)
+            return config
+
+    available = sorted(n for n in dir(mtq) if n.endswith("_CFG"))
+    raise RuntimeError(
+        f"None of {candidates} exist in nvidia-modelopt {getattr(mtq, '__version__', '?')}. "
+        f"The {recipe.family.value} family cannot run.\n"
+        f"Available configs: {available}\n"
+        "Either repin ModelOpt, update _QUANT_CONFIG_PREFERENCE, or drop the "
+        "family and record the omission - do not substitute a config with a "
+        "different activation width, which would make the two families identical."
+    )
 
 
 def run_single_quantization(
@@ -530,6 +547,7 @@ def run_phase3(
 
 __all__ = [
     "MUTABLE_RECIPE_KEYS",
+    "_QUANT_CONFIG_PREFERENCE",
     "QuantizationRun",
     "Recipe",
     "RecipeMismatchError",

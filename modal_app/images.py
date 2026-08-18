@@ -21,6 +21,10 @@ PYTHON_VERSION = "3.12"
 # Blackwell SM100+; the image will build on any host but the kernels only
 # exist on B200/B300/GB200.
 VLLM_VERSION = "0.27.1"
+# vLLM 0.27.1 resolves its own torch; the observed runtime version inside the
+# image is 2.13.0+cu130 regardless of what is requested here, so this pin is
+# a floor rather than an exact match. Recorded because a silent torch swap
+# changes kernel selection.
 TORCH_VERSION = "2.9.0"
 MODELOPT_VERSION = "0.40.0"
 CUDA_TAG = "12.8.1"
@@ -86,7 +90,7 @@ gpu_image = (
     )
     .pip_install(
         f"vllm=={VLLM_VERSION}",
-        f"nvidia-modelopt=={MODELOPT_VERSION}",
+        f"nvidia-modelopt[hf]=={MODELOPT_VERSION}",
         "accelerate>=1.2",
         "flashinfer-python>=0.2",
     )
