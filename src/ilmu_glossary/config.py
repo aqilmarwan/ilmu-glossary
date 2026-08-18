@@ -167,6 +167,7 @@ class VllmConfig(BaseModel):
         mamba_state: MambaStateDtype,
         max_model_len: int,
         hybrid_mamba: bool = True,
+        max_logprobs: int | None = None,
     ) -> list[str]:
         """Build the `vllm serve` argv. Single source of truth for serving.
 
@@ -187,6 +188,12 @@ class VllmConfig(BaseModel):
             str(max_model_len),
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
+            # Tier 1 asks for the top-K logprobs per token. vLLM rejects any
+            # request whose `logprobs` exceeds this with a bare HTTP 400, so it
+            # must be raised to at least eval.kl_top_k or the primary metric
+            # cannot be collected at all.
+            "--max-logprobs",
+            str(max(max_logprobs or 20, 20)),
             "--host",
             "0.0.0.0",
             "--port",

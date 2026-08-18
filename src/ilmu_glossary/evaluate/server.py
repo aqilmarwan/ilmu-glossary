@@ -166,6 +166,7 @@ def serve(
         model_path,
         mamba_state=mamba_state,
         max_model_len=effective,
+        max_logprobs=cfg.eval.kl_top_k,
         # The dry-run proxy is a plain transformer MoE; Mamba/Nemotron flags
         # would make vLLM refuse to start.
         hybrid_mamba=not cfg.dry_run,
@@ -206,8 +207,18 @@ def post_json(url: str, payload: dict[str, Any], *, timeout: int = 600) -> dict[
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result: dict[str, Any] = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result: dict[str, Any] = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # vLLM returns the reason in the body. Letting the bare status through
+        # turns a one-line config problem ("logprobs exceeds max_logprobs")
+        # into a blind debugging session.
+        try:
+            detail = exc.read().decode()[:600]
+        except Exception:
+            detail = "<no body>"
+        raise RuntimeError(f"vLLM returned HTTP {exc.code} for {url}: {detail}") from exc
     return result
 
 
