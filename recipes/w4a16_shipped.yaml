@@ -4,76 +4,130 @@
 #   Model-Optimizer/modelopt_recipes/huggingface/models/nvidia/
 #     Nemotron-3.5-Lightning-30B-A3B-BF16/ptq/w4a16_nvfp4_4o6.yaml
 #
-# ONLY the calibration data source may differ between variants in this family.
-# Precision assignments, block sizes and layer exclusions are identical across
-# every variant, or the comparison is confounded (spec section 6).
-# `quantize.assert_recipe_identity` hashes everything below the
-# `calibration:` key and refuses to run if two variants disagree.
+# Every assignment below is transcribed from the SHIPPED checkpoint's own
+# hf_quant_config.json (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4,
+# read 2026-08-18), not from the model card prose. Measured layer counts:
 #
-# Ecological validity: this is the configuration people actually deploy.
-# Note that expert quantization here is WEIGHT-ONLY (W4A16). There are no
-# expert activation scales, so the calibration set influences this checkpoint
-# only through the static MSE precision search. See SPEC_DEVIATIONS.md D2.
+#   backbone.layers.N.mixer.experts.N.up_proj        2944   W4A16_NVFP4
+#   backbone.layers.N.mixer.experts.N.down_proj      2944   W4A16_NVFP4
+#   backbone.layers.N.mixer.shared_experts.up_proj     23   W4A16_NVFP4
+#   backbone.layers.N.mixer.shared_experts.down_proj   23   W4A16_NVFP4
+#   backbone.layers.N.mixer.in_proj                    23   FP8
+#   backbone.layers.N.mixer.out_proj                   23   FP8
+#   lm_head                                             1   W4A16_NVFP4
+#   excluded (72): embeddings, conv1d, gate, q/k/v/o_proj, mtp*
+#   kv_cache_quant_algo: FP8
+#
+# 2944 / 23 MoE layers = 128 experts per layer, matching n_routed_experts=128
+# with num_experts_per_tok=6.
+#
+# ONLY the calibration data source may differ between variants in this family.
+# `quantize.assert_recipe_identity` hashes everything below the `calibration:`
+# key and refuses to run if two variants disagree (spec section 6).
+#
+# Expert quantization here is WEIGHT-ONLY (W4A16). There are no expert
+# activation scales, so the calibration set influences this checkpoint only
+# through the static MSE precision search. See SPEC_DEVIATIONS.md D2.
 
 name: w4a16_shipped
 upstream: w4a16_nvfp4_4o6.yaml
 upstream_repo: https://github.com/NVIDIA/Model-Optimizer
+transcribed_from: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/hf_quant_config.json
+verified_on: 2026-08-18
+shipped_by_nvidia: true
 description: >-
   NVIDIA's shipped four-over-six NVFP4 recipe for Nemotron 3.5 Lightning.
-  W4A16 on routed and shared experts, FP8 dynamic on Mamba projections,
-  attention left in BF16.
+  W4A16 on routed and shared experts, FP8 on Mamba in/out projections,
+  attention and routers left in BF16.
+
+architecture:
+  model_type: nemotron_h
+  n_routed_experts: 128
+  num_experts_per_tok: 6
+  n_moe_layers: 23
 
 quantization:
-  algorithm: mse                    # static MSE search, not max/amax calibration
+  algorithm: mse                    # static MSE search, not amax calibration
   default_precision: bfloat16
+  quant_algo: MIXED_PRECISION
 
   layers:
-    # Routed experts - the aggressive tier, weights only.
-    - pattern: "*.experts.*"
+    # Routed experts - the aggressive tier, weights only. This model's expert
+    # MLP has no gate_proj; only up_proj and down_proj are quantized.
+    - pattern: "*.mixer.experts.*.up_proj"
       format: nvfp4
+      quant_algo: W4A16_NVFP4
       weight_bits: 4
       activation_bits: 16           # W4A16: no activation quantization
-      block_size: 16                # NVFP4 E2M1 with per-block FP8 E4M3 scale
+      group_size: 16                # NVFP4 E2M1, per-block FP8 E4M3 scale
       scale_format: fp8_e4m3
       global_scale: fp32
-
-    # Shared experts - same treatment on this model.
-    - pattern: "*.shared_expert*"
+    - pattern: "*.mixer.experts.*.down_proj"
       format: nvfp4
+      quant_algo: W4A16_NVFP4
       weight_bits: 4
       activation_bits: 16
-      block_size: 16
+      group_size: 16
       scale_format: fp8_e4m3
       global_scale: fp32
 
+    # Shared experts - same precision. They see every token regardless of
+    # routing, so they are not subject to the coverage mechanism.
+    - pattern: "*.mixer.shared_experts.up_proj"
+      format: nvfp4
+      quant_algo: W4A16_NVFP4
+      weight_bits: 4
+      activation_bits: 16
+      group_size: 16
+    - pattern: "*.mixer.shared_experts.down_proj"
+      format: nvfp4
+      quant_algo: W4A16_NVFP4
+      weight_bits: 4
+      activation_bits: 16
+      group_size: 16
+
     # Mamba projections - FP8 per-tensor, dynamic scales.
-    - pattern: "*.mamba.in_proj"
+    - pattern: "*.mixer.in_proj"
       format: fp8
+      quant_algo: FP8
       scale_format: e4m3
       scale_mode: dynamic
       granularity: per_tensor
-    - pattern: "*.mamba.out_proj"
+    - pattern: "*.mixer.out_proj"
       format: fp8
+      quant_algo: FP8
       scale_format: e4m3
       scale_mode: dynamic
       granularity: per_tensor
+
+    # NVIDIA quantizes lm_head - the "faithful lm_head" from their write-up.
+    - pattern: "lm_head"
+      format: nvfp4
+      quant_algo: W4A16_NVFP4
+      weight_bits: 4
+      activation_bits: 16
+      group_size: 16
 
   exclude:
     # Attention projections stay BF16 on this recipe.
-    - "*.self_attn.q_proj"
-    - "*.self_attn.k_proj"
-    - "*.self_attn.v_proj"
-    - "*.self_attn.o_proj"
+    - "*.mixer.q_proj"
+    - "*.mixer.k_proj"
+    - "*.mixer.v_proj"
+    - "*.mixer.o_proj"
+    # Mamba causal conv.
+    - "*.mixer.conv1d"
     # Routers must never be quantized. A perturbed router changes which
     # experts fire, which would confound the entire study - the routing
     # distribution has to stay fixed while only expert numerics change.
-    - "*.gate"
-    - "*.router*"
-    - "lm_head"
-    - "*.embed_tokens"
+    # NVIDIA excludes them too.
+    - "*.mixer.gate"
+    - "backbone.embeddings"
+    # Multi-token-prediction heads; speculative decoding is out of scope.
+    - "mtp*"
 
   kv_cache:
     format: fp8
+    quant_algo: FP8
     scale_format: e4m3
 
   mamba_ssm_state:

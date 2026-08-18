@@ -93,6 +93,28 @@ def _layer_index_from_name(name: str) -> int:
     return int(parts[-1]) if parts else -1
 
 
+def infer_num_experts(model: Any) -> int | None:
+    """Read the routed-expert count from the model config, if it states one.
+
+    Knowing the true count turns router discovery from a heuristic into an
+    exact filter: on Nemotron-H the MoE router is `backbone.layers.N.mixer.gate`
+    with out_features == n_routed_experts (128), while other `.gate`-suffixed
+    projections in the same block have different widths.
+    """
+    config = getattr(model, "config", None)
+    for attr in (
+        "n_routed_experts",
+        "num_experts",
+        "moe_num_experts",
+        "num_local_experts",
+        "n_experts",
+    ):
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and value > 1:
+            return value
+    return None
+
+
 def discover_routers(model: Any) -> list[RouterModule]:
     """Locate every MoE router by walking the module tree.
 
@@ -105,6 +127,7 @@ def discover_routers(model: Any) -> list[RouterModule]:
     projects to the intermediate size, not the expert count - from being
     mistaken for a router.
     """
+    expected = infer_num_experts(model)
     found: list[RouterModule] = []
     for name, module in model.named_modules():
         if not _ROUTER_RE.search(name):
@@ -126,6 +149,27 @@ def discover_routers(model: Any) -> list[RouterModule]:
                 num_experts=int(out_features),
             )
         )
+
+    if expected is not None:
+        exact = [r for r in found if r.num_experts == expected]
+        if exact:
+            dropped = len(found) - len(exact)
+            if dropped:
+                logger.info(
+                    "Discarded %d candidate router(s) whose width != n_routed_experts=%d",
+                    dropped,
+                    expected,
+                )
+            found = exact
+        else:
+            logger.warning(
+                "No candidate router has out_features == n_routed_experts=%d. "
+                "Keeping all %d candidates, but verify them against the module "
+                "tree before trusting phase 1 - a wrong router set makes every "
+                "routing statistic meaningless.",
+                expected,
+                len(found),
+            )
 
     found.sort(key=lambda r: (r.layer_index, r.name))
     if not found:
@@ -746,6 +790,7 @@ __all__ = [
     "discover_routers",
     "dump_module_tree",
     "evaluate_routing_gate",
+    "infer_num_experts",
     "infer_top_k",
     "jensen_shannon",
     "kl_divergence",
