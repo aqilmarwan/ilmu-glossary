@@ -279,6 +279,36 @@ def _markdown_table(df: pd.DataFrame | None, *, max_rows: int = 40, note: str = 
     return "\n".join(lines) + "\n"
 
 
+def _coverage_comparability_note(df: pd.DataFrame | None) -> str:
+    """Warn when coverage rows were measured over different document counts.
+
+    `coverage_greedy` can only select documents phase 1 profiled, so it is
+    always measured at profile_coverage_frac = 1.0, while a randomly sampled
+    variant may be measured over a fraction of its documents. Comparing
+    absolute token counts across those rows overstates coverage_greedy, which
+    is the very variant under test.
+    """
+    if df is None or df.empty or "profile_coverage_frac" not in df.columns:
+        return ""
+    incomparable = df[~df.get("comparable", pd.Series(dtype=bool)).fillna(False).astype(bool)]
+    if incomparable.empty:
+        return ""
+    names = ", ".join(
+        f"`{row['variant']}`@N={row['n_samples']} "
+        f"({100 * float(row['profile_coverage_frac']):.0f}%)"
+        for _, row in incomparable.iterrows()
+    )
+    return (
+        "\n> **Not comparable across rows.** Coverage is summed over the selected "
+        "documents that phase 1 profiled. `coverage_greedy` selects only from "
+        "profiled documents, so it always scores at 100%, while these variants "
+        f"were measured over fewer: {names}. Their absolute min/P10 counts "
+        "understate them. Compare `min_expert_tokens_per_profiled_doc`, or "
+        "enlarge `data.candidate_pool_size` so phase 1 profiles the entire "
+        "train split and every row is measured at 100%.\n"
+    )
+
+
 def _contamination_note(df: pd.DataFrame | None) -> str:
     """Emit the contamination banner if any contaminated row is present."""
     if df is None or df.empty or "contaminated" not in df.columns:
@@ -375,6 +405,7 @@ def build_report(cfg: Config, artifacts: Artifacts) -> str:
     add("## 3. Expert coverage achieved by each calibration variant\n")
     add(_markdown_table(artifacts.calibration_coverage))
     add(_contamination_note(artifacts.calibration_coverage))
+    add(_coverage_comparability_note(artifacts.calibration_coverage))
     add(
         "\n`min_expert_tokens` and `p10_expert_tokens` are the quantities that "
         "determine whether an expert's scales are estimable at all. "

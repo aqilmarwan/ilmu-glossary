@@ -54,6 +54,10 @@ BM_CLASSES = (
 )
 EN_CLASSES = (CorpusClass.ENGLISH_CONTROL.value,)
 
+# Below this fraction of selected documents carrying a routing profile, a
+# variant's absolute coverage numbers are not comparable with other variants.
+PROFILE_COVERAGE_FLOOR = 0.9
+
 
 # --------------------------------------------------------------------------
 # coverage-greedy
@@ -424,19 +428,46 @@ def coverage_statistics(
         return {}
     vectors = [profiles_by_doc[d.doc_id] for d in selected if d.doc_id in profiles_by_doc]
     if not vectors:
+        logger.warning(
+            "No selected document carries a routing profile. Coverage for this "
+            "variant is unmeasured, not zero - it must not be reported as a "
+            "coverage failure."
+        )
         return {
-            "min_expert_tokens": 0.0,
-            "p10_expert_tokens": 0.0,
-            "median_expert_tokens": 0.0,
-            "mean_expert_tokens": 0.0,
-            "frac_experts_unseen": 1.0,
+            "min_expert_tokens": float("nan"),
+            "p10_expert_tokens": float("nan"),
+            "median_expert_tokens": float("nan"),
+            "mean_expert_tokens": float("nan"),
+            "frac_experts_unseen": float("nan"),
             "n_docs_with_profile": 0.0,
-            "gini_coefficient": 0.0,
+            "profile_coverage_frac": 0.0,
+            "min_expert_tokens_per_profiled_doc": float("nan"),
+            "comparable": False,
+            "gini_coefficient": float("nan"),
         }
 
     coverage = np.vstack(vectors).sum(axis=0).astype(np.float64)
     if coverage.shape[0] < n_experts:
         coverage = np.pad(coverage, (0, n_experts - coverage.shape[0]))
+
+    # Coverage is summed over the selected documents that phase 1 actually
+    # profiled. `coverage_greedy` selects only from profiled documents by
+    # construction, so it is always measured at 1.0 while a randomly sampled
+    # variant may be measured over a fraction of its documents. Comparing
+    # absolute token counts across rows with different fractions overstates
+    # coverage_greedy. Callers must condition on this column.
+    profile_frac = len(vectors) / max(len(selected), 1)
+    if profile_frac < PROFILE_COVERAGE_FLOOR:
+        logger.warning(
+            "Only %.0f%% of selected documents (%d/%d) carry routing profiles. "
+            "Absolute coverage numbers for this variant are computed over that "
+            "subset and are NOT comparable with a variant measured at a higher "
+            "fraction. Enlarge data.candidate_pool_size so phase 1 profiles the "
+            "whole train split.",
+            100 * profile_frac,
+            len(vectors),
+            len(selected),
+        )
 
     return {
         "min_expert_tokens": float(coverage.min()),
@@ -446,6 +477,12 @@ def coverage_statistics(
         "max_expert_tokens": float(coverage.max()),
         "frac_experts_unseen": float((coverage == 0).mean()),
         "n_docs_with_profile": float(len(vectors)),
+        "profile_coverage_frac": profile_frac,
+        # Tokens per profiled document - the like-for-like figure. Absolute
+        # min/P10 are what spec section 5 asks for and are kept, but this is
+        # what may be compared across variants when the fractions differ.
+        "min_expert_tokens_per_profiled_doc": float(coverage.min()) / max(len(vectors), 1),
+        "comparable": profile_frac >= PROFILE_COVERAGE_FLOOR,
         "gini_coefficient": _gini(coverage),
     }
 
