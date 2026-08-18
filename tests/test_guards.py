@@ -8,6 +8,7 @@ and ends up in a report.
 from __future__ import annotations
 
 from itertools import pairwise
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
@@ -830,3 +831,74 @@ class TestExpertQuantizationGuard:
 
         carriers, _ = count_routed_expert_carriers(self._model(experts_quantized=True))
         assert carriers == 1
+
+
+class TestMalayMmluPrompt:
+    """MalayMMLU ships options already lettered AND already embedded in the
+    `prompt` field. Rendering them again yields "A. A. kunci (keys)" under a
+    duplicated option block - a malformed prompt that still produces
+    accuracies, so it would never announce itself."""
+
+    RECORD: ClassVar[dict[str, object]] = {
+        "id": 1,
+        "prompt": (
+            "Pasangan algoritma yang digunakan untuk melakukan penyulitan "
+            "dan nyahsulit dikenali sebagai\nA. kunci (keys)\nB. Sifer (cipher)\n"
+            "C. Teks sifer (ciphertext)"
+        ),
+        "answer": "B. Sifer (cipher)",
+        "options": ["A. kunci (keys)", "B. Sifer (cipher)", "C. Teks sifer (ciphertext)"],
+        "key": "B",
+        "subject": "Sains Komputer",
+        "category": "STEM",
+        "level": "Secondary",
+    }
+
+    def _parsed(self):  # type: ignore[no-untyped-def]
+        from ilmu_glossary.evaluate.mmlu import _parse_malay_mmlu_record
+
+        question = _parse_malay_mmlu_record(self.RECORD)
+        assert question is not None
+        return question
+
+    def test_options_are_stored_without_their_letter(self) -> None:
+        assert self._parsed().options == (
+            "kunci (keys)",
+            "Sifer (cipher)",
+            "Teks sifer (ciphertext)",
+        )
+
+    def test_prompt_renders_each_option_exactly_once(self) -> None:
+        prompt = self._parsed().prompt()
+        for text in ("kunci (keys)", "Sifer (cipher)", "Teks sifer (ciphertext)"):
+            assert prompt.count(text) == 1, f"{text!r} appears {prompt.count(text)} times"
+
+    def test_no_doubled_letter_prefix(self) -> None:
+        import re
+
+        assert re.search(r"\b([A-E])\.\s+\1\.\s", self._parsed().prompt()) is None
+
+    def test_answer_letter_comes_from_key(self) -> None:
+        question = self._parsed()
+        assert question.answer_letter == "B"
+        assert question.options[question.answer_index] == "Sifer (cipher)"
+
+    def test_embedding_is_detected_not_assumed(self) -> None:
+        """A revision that stops embedding options must still get them."""
+        from ilmu_glossary.evaluate.mmlu import _parse_malay_mmlu_record
+
+        bare = {**self.RECORD, "prompt": "Pasangan algoritma ... dikenali sebagai"}
+        question = _parse_malay_mmlu_record(bare)
+        assert question is not None
+        assert not question.options_in_question
+        prompt = question.prompt()
+        for text in ("kunci (keys)", "Sifer (cipher)"):
+            assert prompt.count(text) == 1
+
+    def test_strip_option_letter_variants(self) -> None:
+        from ilmu_glossary.evaluate.mmlu import strip_option_letter
+
+        assert strip_option_letter("A. kunci") == ("A", "kunci")
+        assert strip_option_letter("B) Sifer") == ("B", "Sifer")
+        assert strip_option_letter("(C) Teks") == ("C", "Teks")
+        assert strip_option_letter("no letter here") == (None, "no letter here")

@@ -26,6 +26,7 @@ the same scorer serves Cross-MMLU.
 from __future__ import annotations
 
 import logging
+import re
 import string
 from dataclasses import dataclass
 from typing import Any
@@ -45,19 +46,38 @@ LETTERS = string.ascii_uppercase
 MALAY_PROMPT_TEMPLATE = (
     "Berikut adalah soalan aneka pilihan tentang {subject}. "
     "Jawab dengan memberikan huruf pilihan yang betul sahaja.\n\n"
-    "{question}\n{options}\nJawapan:"
+    "{question}{options}\nJawapan:"
 )
 
 ENGLISH_PROMPT_TEMPLATE = (
     "The following is a multiple choice question. "
     "Answer with the letter of the correct option only.\n\n"
-    "{question}\n{options}\nAnswer:"
+    "{question}{options}\nAnswer:"
 )
+
+
+# MalayMMLU ships options already lettered ("A. kunci (keys)") AND already
+# embedded in the `prompt` field. Rendering them again produces
+# "A. A. kunci (keys)" under a duplicated option block - a malformed prompt
+# that still yields accuracies, so it would never announce itself.
+_OPTION_PREFIX_RE = re.compile(r"^\s*\(?([A-Za-z])[.):]\s+")
+
+
+def strip_option_letter(option: str) -> tuple[str | None, str]:
+    """Split a possibly-lettered option into (letter, text)."""
+    match = _OPTION_PREFIX_RE.match(option)
+    if match is None:
+        return None, option.strip()
+    return match.group(1).upper(), option[match.end() :].strip()
 
 
 @dataclass(frozen=True)
 class MCQuestion:
-    """One multiple-choice item, normalised across both benchmarks."""
+    """One multiple-choice item, normalised across both benchmarks.
+
+    `options` always holds bare option TEXT with any leading letter stripped,
+    so this class owns the lettering exactly once.
+    """
 
     question_id: str
     question: str
@@ -67,6 +87,9 @@ class MCQuestion:
     category: str = ""
     level: str = ""
     language: str = "malay"
+    # True when `question` already contains the rendered option block, as
+    # every MalayMMLU record does.
+    options_in_question: bool = False
 
     @property
     def answer_letter(self) -> str:
@@ -77,13 +100,16 @@ class MCQuestion:
 
     def prompt(self) -> str:
         template = ENGLISH_PROMPT_TEMPLATE if self.language == "english" else MALAY_PROMPT_TEMPLATE
+        # Do not re-render options the source already embedded.
+        options = "" if self.options_in_question else self.format_options()
+        body = self.question if options == "" else f"{self.question}\n{options}"
         if self.language == "english":
-            return template.format(question=self.question, options=self.format_options())
+            return template.format(question=body, options="").rstrip()
         return template.format(
             subject=self.subject or "pengetahuan am",
-            question=self.question,
-            options=self.format_options(),
-        )
+            question=body,
+            options="",
+        ).rstrip()
 
 
 # --------------------------------------------------------------------------
@@ -141,34 +167,44 @@ def _parse_malay_mmlu_record(record: dict[str, Any]) -> MCQuestion | None:
     if not isinstance(options, list) or len(options) < 2:
         return None
 
-    options = [str(o) for o in options]
-    answer_index: int | None = None
+    raw_options = [str(o) for o in options]
+    stripped = [strip_option_letter(o)[1] for o in raw_options]
+    prompt_text = str(record.get("prompt", ""))
 
+    answer_index: int | None = None
     key = record.get("key")
-    if isinstance(key, str) and key.strip().upper() in LETTERS[: len(options)]:
+    if isinstance(key, str) and key.strip().upper() in LETTERS[: len(raw_options)]:
         answer_index = LETTERS.index(key.strip().upper())
 
     if answer_index is None:
         answer = record.get("answer")
         if isinstance(answer, str):
-            normalised = answer.strip()
-            for i, option in enumerate(options):
-                if option.strip() == normalised:
+            target = strip_option_letter(answer)[1]
+            for i, option in enumerate(stripped):
+                if option == target:
                     answer_index = i
                     break
 
     if answer_index is None:
         return None
 
+    # Every MalayMMLU prompt embeds its option block; check rather than assume,
+    # so a future revision that stops doing so is handled without silently
+    # dropping the options from the prompt.
+    embedded = bool(stripped) and all(
+        opt and opt in prompt_text for opt in stripped[: min(2, len(stripped))]
+    )
+
     return MCQuestion(
         question_id=str(record.get("id", "")),
-        question=str(record.get("prompt", "")),
-        options=tuple(options),
+        question=prompt_text,
+        options=tuple(stripped),
         answer_index=answer_index,
         subject=str(record.get("subject", "")),
         category=str(record.get("category", "")),
         level=str(record.get("level", "")),
         language="malay",
+        options_in_question=embedded,
     )
 
 
@@ -208,7 +244,7 @@ def load_cross_mmlu(cfg: Config) -> dict[str, list[MCQuestion]]:
                 MCQuestion(
                     question_id=str(record.get("id", len(items))),
                     question=str(record.get("question", "")),
-                    options=tuple(str(o) for o in options),
+                    options=tuple(strip_option_letter(str(o))[1] for o in options),
                     answer_index=index,
                     subject=str(record.get("category", "")),
                     language=language,
@@ -404,4 +440,5 @@ __all__ = [
     "load_malay_mmlu",
     "score_first_token",
     "score_full_answer",
+    "strip_option_letter",
 ]
