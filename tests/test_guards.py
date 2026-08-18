@@ -751,3 +751,82 @@ class TestLidLabelsMatchModels:
             f"LID models emit labels the pipeline does not recognise: {unknown}. "
             "Documents carrying them are silently dropped."
         )
+
+
+class TestExpertQuantizationGuard:
+    """A checkpoint whose routed experts were never quantized still loads,
+    still serves, and still yields a full set of evaluation numbers - numbers
+    that say nothing about the hypothesis. This is the most dangerous failure
+    mode in the pipeline, so it must be fatal rather than a warning."""
+
+    class _Quantizer:
+        def __init__(self, enabled: bool) -> None:
+            self.is_enabled = enabled
+
+    class _FakeModule:
+        def __init__(self, params: dict[str, object], quantizer: object | None = None) -> None:
+            self._params = params
+            if quantizer is not None:
+                self.weight_quantizer = quantizer
+
+        def named_parameters(self, recurse: bool = True) -> list[tuple[str, object]]:
+            del recurse
+            return list(self._params.items())
+
+    class _FakeModel:
+        def __init__(self, modules: dict[str, object]) -> None:
+            self._modules_by_name = modules
+
+        def named_modules(self) -> list[tuple[str, object]]:
+            return list(self._modules_by_name.items())
+
+    def _model(self, *, experts_quantized: bool):  # type: ignore[no-untyped-def]
+        q = self._Quantizer(True) if experts_quantized else None
+        return self._FakeModel(
+            {
+                # transformers 5.x fused layout: one carrier, 3D batched params.
+                "model.layers.0.mlp.experts": self._FakeModule(
+                    {"gate_up_proj": object(), "down_proj": object()}, q
+                ),
+                "model.layers.0.mlp.shared_expert.gate_proj": self._FakeModule(
+                    {"weight": object()}, self._Quantizer(True)
+                ),
+                "model.layers.0.self_attn.q_proj": self._FakeModule(
+                    {"weight": object()}, self._Quantizer(True)
+                ),
+            }
+        )
+
+    def test_shared_experts_do_not_satisfy_the_guard(self) -> None:
+        """Shared experts see every token regardless of routing, so quantizing
+        them proves nothing about routing-driven coverage."""
+        from ilmu_glossary.quantize import UnquantizedExpertsError, assert_experts_quantized
+
+        with pytest.raises(UnquantizedExpertsError, match="NONE quantized"):
+            assert_experts_quantized(self._model(experts_quantized=False), family="w4a16_shipped")
+
+    def test_passes_when_routed_experts_are_quantized(self) -> None:
+        from ilmu_glossary.quantize import assert_experts_quantized
+
+        carriers, quantized = assert_experts_quantized(
+            self._model(experts_quantized=True), family="w4a16_shipped"
+        )
+        assert carriers == 1
+        assert quantized == 1
+
+    def test_no_carriers_at_all_is_fatal(self) -> None:
+        from ilmu_glossary.quantize import UnquantizedExpertsError, assert_experts_quantized
+
+        empty = self._FakeModel(
+            {"model.layers.0.self_attn.q_proj": self._FakeModule({"weight": object()})}
+        )
+        with pytest.raises(UnquantizedExpertsError, match="No modules carrying"):
+            assert_experts_quantized(empty, family="w4a16_shipped")
+
+    def test_fused_3d_carrier_is_detected(self) -> None:
+        """The fused layout must be counted; a Linear-only detector reports
+        zero carriers and the guard would misdiagnose the failure."""
+        from ilmu_glossary.quantize import count_routed_expert_carriers
+
+        carriers, _ = count_routed_expert_carriers(self._model(experts_quantized=True))
+        assert carriers == 1

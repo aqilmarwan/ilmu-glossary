@@ -255,6 +255,8 @@ class QuantizationRun:
     wall_clock_s: float = 0.0
     peak_memory_gb: float = 0.0
     n_quantized_modules: int = 0
+    expert_carriers: int = 0
+    experts_quantized: int = 0
     fallback_layers: list[str] = field(default_factory=list)
     contaminated: bool = False
     error: str | None = None
@@ -272,6 +274,8 @@ class QuantizationRun:
             "wall_clock_s": self.wall_clock_s,
             "peak_memory_gb": self.peak_memory_gb,
             "n_quantized_modules": self.n_quantized_modules,
+            "expert_carriers": self.expert_carriers,
+            "experts_quantized": self.experts_quantized,
             "n_fallback_layers": len(self.fallback_layers),
             "fallback_layers": ";".join(self.fallback_layers[:32]),
             "contaminated": self.contaminated,
@@ -424,6 +428,12 @@ def run_single_quantization(
             model = mtq.quantize(model, quant_cfg, forward_loop=forward_loop)
 
             run.n_quantized_modules, run.fallback_layers = _inspect_quantized(model)
+            # Refuse to persist a checkpoint whose routed experts are untouched.
+            # Saving it would let phase 4 produce a full set of plausible
+            # numbers about a configuration that never tested the hypothesis.
+            run.expert_carriers, run.experts_quantized = assert_experts_quantized(
+                model, family=family
+            )
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)
@@ -457,6 +467,82 @@ def run_single_quantization(
         len(run.fallback_layers),
     )
     return row
+
+
+class UnquantizedExpertsError(RuntimeError):
+    """Raised when PTQ produced a checkpoint whose routed experts are untouched.
+
+    The entire study is about routed experts. A checkpoint that quantizes only
+    attention and the shared expert would still load, still serve, and still
+    produce evaluation numbers - numbers that say nothing about the hypothesis.
+    That is the single most dangerous failure mode here, so it is fatal.
+    """
+
+
+def _is_routed_expert(name: str) -> bool:
+    """True for modules carrying routed-expert weights, shared experts excluded.
+
+    Shared experts see every token regardless of routing, so they are not
+    subject to the coverage mechanism and do not count towards this guard.
+    """
+    lowered = name.lower()
+    return "expert" in lowered and "shared" not in lowered
+
+
+def count_routed_expert_carriers(model: Any) -> tuple[int, int]:
+    """(modules holding routed-expert weights, how many of them are quantized).
+
+    transformers 5.x fuses MoE experts into batched 3D parameters on a single
+    module - Qwen2MoeExperts carries `gate_up_proj` of shape
+    (num_experts, 2*intermediate, hidden) rather than exposing one nn.Linear
+    per expert. ModelOpt's Linear-targeting configs therefore never see them.
+    Counting *carriers* rather than Linears is what makes this detectable on
+    both the fused and unfused layouts.
+    """
+    carriers = 0
+    quantized = 0
+    for name, module in model.named_modules():
+        if not _is_routed_expert(name):
+            continue
+        params = [p for _, p in module.named_parameters(recurse=False)]
+        if not params:
+            continue
+        carriers += 1
+        weight_quantizer = getattr(module, "weight_quantizer", None)
+        if weight_quantizer is not None and getattr(weight_quantizer, "is_enabled", False):
+            quantized += 1
+    return carriers, quantized
+
+
+def assert_experts_quantized(model: Any, *, family: str) -> tuple[int, int]:
+    """Fail loudly if PTQ left every routed expert in full precision."""
+    carriers, quantized = count_routed_expert_carriers(model)
+    if carriers == 0:
+        raise UnquantizedExpertsError(
+            "No modules carrying routed-expert weights were found. Either the "
+            "architecture nests them under an unexpected name, or this model "
+            "has no routed experts at all. Inspect the module tree before "
+            "trusting any downstream number."
+        )
+    if quantized == 0:
+        raise UnquantizedExpertsError(
+            f"{family}: {carriers} routed-expert carriers found, NONE quantized. "
+            "The checkpoint would serve and produce evaluation numbers, but its "
+            "routed experts are still full precision - so those numbers would "
+            "say nothing about the hypothesis under test.\n\n"
+            "Most likely cause: transformers 5.x fuses MoE experts into batched "
+            "3D parameters (e.g. Qwen2MoeExperts.gate_up_proj of shape "
+            "(num_experts, 2*intermediate, hidden)) instead of one nn.Linear per "
+            "expert, and ModelOpt's Linear-targeting configs skip them. Check "
+            "whether ModelOpt's fused-MoE plugin loaded - a warning reading "
+            "\"Failed to import vllm plugin ... has no attribute 'FusedMoE'\" "
+            "means it did not, and that plugin is the fused-MoE path.\n\n"
+            "Fixes, in order of preference: pin a modelopt/vllm pair whose MoE "
+            "plugin imports; pin transformers to a version that keeps experts "
+            "unfused; or add an explicit fused-expert quantization path."
+        )
+    logger.info("%s: %d/%d routed-expert carriers quantized", family, quantized, carriers)
+    return carriers, quantized
 
 
 def _inspect_quantized(model: Any) -> tuple[int, list[str]]:
@@ -551,8 +637,11 @@ __all__ = [
     "QuantizationRun",
     "Recipe",
     "RecipeMismatchError",
+    "UnquantizedExpertsError",
+    "assert_experts_quantized",
     "assert_recipe_identity",
     "build_forward_loop",
+    "count_routed_expert_carriers",
     "load_calibration_texts",
     "load_recipe",
     "materialise_recipe",
