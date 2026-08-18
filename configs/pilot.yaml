@@ -1,0 +1,140 @@
+# PILOT configuration - de-risks the real model before the full study.
+#
+# Purpose: prove that PTQ runs end to end on Nemotron 3.5 Lightning itself,
+# not on a proxy. Everything the dry run could not answer - a 30B download,
+# real chat templating, the recipe's module namespace, fused-expert
+# quantization at full width - is answered here for one cell.
+#
+# This is NOT a scientific configuration. Corpus sizes and the calibration
+# sequence length are reduced to keep the de-risking run cheap; results from
+# it must not be reported. Use configs/config.yaml for the real study.
+
+seed: 42
+dry_run: false          # -> the real Nemotron checkpoint, real chat template
+
+model:
+  bf16_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  nvfp4_reference_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+  revision: main
+  resolved_on: 2026-08-18
+  trust_remote_code: true
+  fallback_bf16_repo: nvidia/Nemotron-3-Super-120B-A12B-BF16
+  # 4096 rather than NVIDIA's 32768: this run is about whether PTQ works at
+  # all, and 32K calibration on a 30B model is the expensive part.
+  calib_seq_len: 4096
+  eval_max_model_len: 8192
+
+data:
+  min_docs_per_class: 400
+  min_dialect_docs: 50
+  min_parallel_pairs: 200
+  alignment_check_sample: 200
+  language_spotcheck_sample: 100
+  candidate_pool_size: 600
+  train_fraction: 0.8
+  dedup_ngram: 13
+  dedup_threshold: 0.8
+  min_doc_chars: 200
+  max_records_per_source: 60000
+
+  sources:
+    formal_bm:
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        data_files: [utusan.jsonl, sinarharian.jsonl, bernama.com-tam.jsonl, kosmo.jsonl]
+    manglish:
+      - repo_id: mesolitica/chatgpt-noisy-translation-manglish
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: json_array
+        array_text_index: 1
+        provenance: malaysian
+        data_files: [filtered-manglish.jsonl, process-manglish.jsonl]
+    code_switched:
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        data_files: [lowyat.jsonl, c.cari.com.my.jsonl, carigold.jsonl]
+    dialect:
+      - repo_id: malaysia-ai/dedup-text-dataset
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: bare_string
+        provenance: malaysian
+        data_files: [b.cari.com.my.jsonl, facebook.jsonl]
+    english_control:
+      - repo_id: HuggingFaceFW/fineweb-edu
+        kind: hf_dataset
+        config_name: sample-10BT
+        split: train
+        text_field: text
+        record_format: object
+        streaming: true
+        provenance: english
+    code_control:
+      - repo_id: codeparrot/codeparrot-clean-valid
+        kind: hf_dataset
+        split: train
+        text_field: content
+        record_format: object
+        streaming: true
+        provenance: code
+    parallel_bm_en:
+      - repo_id: mesolitica/noisy-standard-malay-translation-instructions
+        kind: hf_dataset
+        loader: raw_jsonl
+        record_format: instruction_pair
+        provenance: mixed
+        data_files:
+          - lowyat-instructions.jsonl
+          - b.cari.com.my-instructions.jsonl
+          - c.cari.com.my-instructions.jsonl
+
+lid:
+  primary_model: mesolitica/fasttext-language-detection-v2
+  ms_id_model: mesolitica/fasttext-language-detection-ms-id
+  quantized: true
+
+calibration:
+  sample_counts: [64]
+  gate_variant: oracle_contaminated
+  gate_sample_count: 64
+  gate_min_relative_headroom: 0.10
+  assumed_traffic_mix:
+    formal_bm: 0.25
+    manglish: 0.30
+    code_switched: 0.20
+    english_control: 0.20
+    code_control: 0.05
+
+quant:
+  families: [w4a16_shipped, w4a4_mechanism]
+  recipe_dir: recipes
+  calib_batch_size: 1
+
+eval:
+  kl_top_k: 256
+  kl_max_pairs: 200
+  kl_max_tokens_per_side: 1024
+  ppl_max_docs_per_class: 100
+  malay_mmlu_files: [MalayMMLU_0shot.json]
+  throughput_concurrencies: [1, 8]
+  bootstrap_resamples: 500
+
+paths:
+  # Subdirectory of the mounted volume, so pilot artifacts never mix with
+  # the dry-run ones and neither needs a separate Modal volume.
+  root: /vol/pilot
+
+modal:
+  gpu: B200
+
+tracking:
+  enabled: true
+  experiment_name: routing-aware-calibration-pilot
+  tracking_uri: file:///vol/pilot/mlruns
