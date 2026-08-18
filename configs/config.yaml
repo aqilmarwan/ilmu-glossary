@@ -101,14 +101,20 @@ data:
         notes: English of comparable formal/expository register.
 
     code_control:
-      - repo_id: bigcode/the-stack-smol
+      # bigcode/the-stack-smol is GATED (verified 2026-08-18) and would stall
+      # phase 0 waiting on a licence click. codeparrot-clean-valid is ungated
+      # and serves the same purpose - the code class is a control, so its
+      # exact provenance matters less than that it is unambiguously code.
+      - repo_id: codeparrot/codeparrot-clean-valid
         kind: hf_dataset
         split: train
         text_field: content
         streaming: true
         provenance: code
         licence: multiple-see-upstream
-        notes: Source code control class.
+        notes: >-
+          Source code control class. Swap to bigcode/the-stack-smol if you
+          accept its licence on the Hub - it is the better corpus, just gated.
 
     parallel_bm_en:
       - repo_id: mesolitica/noisy-standard-malay-translation-instructions

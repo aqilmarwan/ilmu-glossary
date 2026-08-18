@@ -228,7 +228,8 @@ class RoutingCapture:
         entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
         self.entropy_sums[layer_index] += float(entropy.sum().item())
         self.token_totals[layer_index] += int(flat.shape[0])
-        return local_np
+        counted: np.ndarray = local_np
+        return counted
 
     def frequency(self, layer_index: int) -> np.ndarray:
         """Normalised activation frequency vector for one layer."""
@@ -479,7 +480,7 @@ def run_phase1(cfg: Config) -> dict[str, Any]:
             device_map="auto",
             trust_remote_code=cfg.model.trust_remote_code,
         )
-        model.eval()
+        model.eval()  # type: ignore[no-untyped-call]  # transformers is untyped
 
         routers = discover_routers(model)
         top_k = infer_top_k(model)

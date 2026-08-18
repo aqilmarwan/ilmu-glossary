@@ -83,7 +83,7 @@ def saturation_threshold(profiles: np.ndarray, n_select: int) -> float:
     tokens for scale estimation is negligible; below it an expert's scale is
     estimated from too few observations. It is the knee the objective needs.
     """
-    n_experts = profiles.shape[1]
+    n_experts = int(profiles.shape[1])
     mean_doc_tokens = float(profiles.sum(axis=1).mean()) if profiles.size else 0.0
     return max(1.0, n_select * mean_doc_tokens / max(n_experts, 1))
 
@@ -98,7 +98,10 @@ def _saturated_gain(coverage: np.ndarray, profile: np.ndarray, tau: float) -> fl
     priority queue below *exact* rather than heuristic, because submodularity
     is precisely the property that marginal gains never increase.
     """
-    return float(np.minimum(coverage + profile, tau).sum() - np.minimum(coverage, tau).sum())
+    gained: np.floating[Any] = (
+        np.minimum(coverage + profile, tau).sum() - np.minimum(coverage, tau).sum()
+    )
+    return float(gained)
 
 
 def coverage_greedy_select(

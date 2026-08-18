@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -44,7 +45,7 @@ class Split:
     def train_fraction(self) -> float:
         return len(self.train_indices) / self.total if self.total else 0.0
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "corpus_class": self.corpus_class,
             "train_indices": list(self.train_indices),
@@ -54,13 +55,18 @@ class Split:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> Split:
+    def from_dict(cls, payload: dict[str, Any]) -> Split:
+        """Rebuild from the persisted JSON.
+
+        Indices are re-read as ints rather than trusted, so a hand-edited
+        splits.json produces a clear failure instead of a silently wrong split.
+        """
         return cls(
             corpus_class=str(payload["corpus_class"]),
-            train_indices=tuple(payload["train_indices"]),  # type: ignore[arg-type]
-            eval_indices=tuple(payload["eval_indices"]),  # type: ignore[arg-type]
-            total=int(payload["total"]),  # type: ignore[arg-type]
-            seed=int(payload["seed"]),  # type: ignore[arg-type]
+            train_indices=tuple(int(i) for i in payload["train_indices"]),
+            eval_indices=tuple(int(i) for i in payload["eval_indices"]),
+            total=int(payload["total"]),
+            seed=int(payload["seed"]),
         )
 
 
@@ -97,7 +103,7 @@ def make_split(
 
 def save_splits(splits: dict[str, Split], directory: Path) -> Path:
     path = directory / SPLIT_FILENAME
-    write_json({name: split.to_dict() for name, split in splits.items()}, path)  # type: ignore[arg-type]
+    write_json({name: split.to_dict() for name, split in splits.items()}, path)
     logger.info("Persisted %d splits to %s", len(splits), path)
     return path
 
@@ -105,7 +111,7 @@ def save_splits(splits: dict[str, Split], directory: Path) -> Path:
 def load_splits(directory: Path) -> dict[str, Split]:
     path = directory / SPLIT_FILENAME
     payload = read_json(path)
-    return {name: Split.from_dict(value) for name, value in payload.items()}  # type: ignore[arg-type]
+    return {name: Split.from_dict(value) for name, value in payload.items()}
 
 
 def assert_internally_consistent(split: Split) -> None:

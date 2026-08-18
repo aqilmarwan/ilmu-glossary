@@ -42,7 +42,8 @@ class TopKLogprobs:
 
     def tail_mass(self) -> np.ndarray:
         """Probability mass outside the retained top-K, per token."""
-        return np.clip(1.0 - np.exp(self.logprobs).sum(axis=1), 0.0, 1.0)
+        mass: np.ndarray = np.clip(1.0 - np.exp(self.logprobs).sum(axis=1), 0.0, 1.0)
+        return mass
 
 
 def token_kl(

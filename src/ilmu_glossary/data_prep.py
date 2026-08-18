@@ -119,7 +119,8 @@ class Deduplicator:
         # (a*x + b) mod prime, minimum over shingles, per permutation.
         prime = np.int64(2**61 - 1)
         hashed = (self._a[:, None] * values[None, :] + self._b[:, None]) % prime
-        return hashed.min(axis=1)
+        signature: np.ndarray = hashed.min(axis=1)
+        return signature
 
     def add_if_new(self, text: str) -> bool:
         """Register a document. False if it duplicates one already seen."""

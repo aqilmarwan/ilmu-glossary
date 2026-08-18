@@ -381,7 +381,16 @@ def accuracy_summary(df: pd.DataFrame, *, group_by: list[str] | None = None) -> 
 
     if not keys:
         return _summarise(df).to_frame().T
-    return df.groupby(keys).apply(_summarise, include_groups=False).reset_index()
+
+    # An explicit loop rather than groupby.apply: apply's return shape depends
+    # on what the callable returns, so the column layout of a results table
+    # would become an implementation detail of pandas.
+    rows: list[dict[str, Any]] = []
+    for group_key, group in df.groupby(keys):
+        values = group_key if isinstance(group_key, tuple) else (group_key,)
+        summary = {str(k): v for k, v in _summarise(group).to_dict().items()}
+        rows.append({**dict(zip(keys, values, strict=True)), **summary})
+    return pd.DataFrame(rows)
 
 
 __all__ = [

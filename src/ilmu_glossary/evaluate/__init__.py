@@ -369,7 +369,9 @@ def _save_reference_cache(path: Path, cache: dict[str, kl_mod.TopKLogprobs]) -> 
     for key, value in cache.items():
         payload[f"{key}::ids"] = value.token_ids
         payload[f"{key}::lps"] = value.logprobs
-    np.savez_compressed(path, **payload)
+    # savez_compressed's stub types its second positional as `bool`; the
+    # **kwargs form is the documented API for named arrays.
+    np.savez_compressed(str(path), **payload)  # type: ignore[arg-type]
     logger.info("Cached %d reference distributions to %s", len(cache), path)
 
 

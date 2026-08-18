@@ -297,7 +297,7 @@ def regression_check(
         )
         rows.append(
             {
-                **row.to_dict(),
+                **{str(k): v for k, v in row.to_dict().items()},
                 "throughput_vs_reference": relative,
                 "regression_flagged": bool(np.isfinite(relative) and abs(relative) > tolerance),
             }
