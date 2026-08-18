@@ -1,0 +1,95 @@
+# Family: w4a4_mechanism
+#
+# NOT A CONFIGURATION NVIDIA SHIPS. Label it as such in every table, plot and
+# caption that reports it.
+#
+# Identical to w4a16_shipped except that routed experts additionally carry
+# per-tensor NVFP4 activation quantization (W4A4). That single change is what
+# makes spec section 0's stated mechanism testable at all:
+#
+#   "Calibration computes per-tensor static scales via absolute amax
+#    aggregated over the calibration set. With top-k routing over many
+#    experts, each expert sees only a fraction of calibration tokens. If
+#    Malay routes differently from the calibration corpus's languages, the
+#    experts Malay depends on receive sparse coverage and unreliable amax
+#    estimates."
+#
+# Under W4A16 there are no expert activation scales, so that chain cannot
+# operate. Under W4A4 it can. Running both families separates "calibration
+# language matters for FP4 MoE in principle" from "calibration language
+# matters for the checkpoint you can download today".
+#
+# See SPEC_DEVIATIONS.md D2.
+
+name: w4a4_mechanism
+upstream: w4a16_nvfp4_4o6.yaml
+upstream_repo: https://github.com/NVIDIA/Model-Optimizer
+shipped_by_nvidia: false
+description: >-
+  Research configuration. W4A4 on routed experts so that per-tensor activation
+  amax estimation genuinely occurs and can be starved by sparse routing
+  coverage. Every other assignment matches the shipped recipe.
+
+quantization:
+  algorithm: max                    # amax calibration - the mechanism under test
+  default_precision: bfloat16
+
+  layers:
+    # Routed experts - W4A4. Activation scales are estimated per tensor by
+    # absolute amax over the calibration set, which is the quantity sparse
+    # routing coverage is hypothesised to damage.
+    - pattern: "*.experts.*"
+      format: nvfp4
+      weight_bits: 4
+      activation_bits: 4
+      block_size: 16
+      scale_format: fp8_e4m3
+      global_scale: fp32
+      activation_scale_mode: static
+      activation_granularity: per_tensor
+      activation_calibrator: max
+
+    # Shared experts stay W4A16, matching the shipped recipe. Shared experts
+    # see every token regardless of routing, so they are not subject to the
+    # coverage mechanism and changing them would add a confound.
+    - pattern: "*.shared_expert*"
+      format: nvfp4
+      weight_bits: 4
+      activation_bits: 16
+      block_size: 16
+      scale_format: fp8_e4m3
+      global_scale: fp32
+
+    - pattern: "*.mamba.in_proj"
+      format: fp8
+      scale_format: e4m3
+      scale_mode: dynamic
+      granularity: per_tensor
+    - pattern: "*.mamba.out_proj"
+      format: fp8
+      scale_format: e4m3
+      scale_mode: dynamic
+      granularity: per_tensor
+
+  exclude:
+    - "*.self_attn.q_proj"
+    - "*.self_attn.k_proj"
+    - "*.self_attn.v_proj"
+    - "*.self_attn.o_proj"
+    - "*.gate"
+    - "*.router*"
+    - "lm_head"
+    - "*.embed_tokens"
+
+  kv_cache:
+    format: fp8
+    scale_format: e4m3
+
+  mamba_ssm_state:
+    dtype: runtime_configurable
+
+calibration:
+  dataset_path: null
+  num_samples: null
+  seq_len: 32768
+  batch_size: 1

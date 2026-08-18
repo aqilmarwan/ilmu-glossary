@@ -1,0 +1,88 @@
+# Family: w4a16_shipped
+#
+# Fork of NVIDIA's published Lightning PTQ recipe:
+#   Model-Optimizer/modelopt_recipes/huggingface/models/nvidia/
+#     Nemotron-3.5-Lightning-30B-A3B-BF16/ptq/w4a16_nvfp4_4o6.yaml
+#
+# ONLY the calibration data source may differ between variants in this family.
+# Precision assignments, block sizes and layer exclusions are identical across
+# every variant, or the comparison is confounded (spec section 6).
+# `quantize.assert_recipe_identity` hashes everything below the
+# `calibration:` key and refuses to run if two variants disagree.
+#
+# Ecological validity: this is the configuration people actually deploy.
+# Note that expert quantization here is WEIGHT-ONLY (W4A16). There are no
+# expert activation scales, so the calibration set influences this checkpoint
+# only through the static MSE precision search. See SPEC_DEVIATIONS.md D2.
+
+name: w4a16_shipped
+upstream: w4a16_nvfp4_4o6.yaml
+upstream_repo: https://github.com/NVIDIA/Model-Optimizer
+description: >-
+  NVIDIA's shipped four-over-six NVFP4 recipe for Nemotron 3.5 Lightning.
+  W4A16 on routed and shared experts, FP8 dynamic on Mamba projections,
+  attention left in BF16.
+
+quantization:
+  algorithm: mse                    # static MSE search, not max/amax calibration
+  default_precision: bfloat16
+
+  layers:
+    # Routed experts - the aggressive tier, weights only.
+    - pattern: "*.experts.*"
+      format: nvfp4
+      weight_bits: 4
+      activation_bits: 16           # W4A16: no activation quantization
+      block_size: 16                # NVFP4 E2M1 with per-block FP8 E4M3 scale
+      scale_format: fp8_e4m3
+      global_scale: fp32
+
+    # Shared experts - same treatment on this model.
+    - pattern: "*.shared_expert*"
+      format: nvfp4
+      weight_bits: 4
+      activation_bits: 16
+      block_size: 16
+      scale_format: fp8_e4m3
+      global_scale: fp32
+
+    # Mamba projections - FP8 per-tensor, dynamic scales.
+    - pattern: "*.mamba.in_proj"
+      format: fp8
+      scale_format: e4m3
+      scale_mode: dynamic
+      granularity: per_tensor
+    - pattern: "*.mamba.out_proj"
+      format: fp8
+      scale_format: e4m3
+      scale_mode: dynamic
+      granularity: per_tensor
+
+  exclude:
+    # Attention projections stay BF16 on this recipe.
+    - "*.self_attn.q_proj"
+    - "*.self_attn.k_proj"
+    - "*.self_attn.v_proj"
+    - "*.self_attn.o_proj"
+    # Routers must never be quantized. A perturbed router changes which
+    # experts fire, which would confound the entire study - the routing
+    # distribution has to stay fixed while only expert numerics change.
+    - "*.gate"
+    - "*.router*"
+    - "lm_head"
+    - "*.embed_tokens"
+
+  kv_cache:
+    format: fp8
+    scale_format: e4m3
+
+  mamba_ssm_state:
+    # Set per-arm at serve time, not baked into the checkpoint.
+    dtype: runtime_configurable
+
+# Replaced per variant by quantize.py. Excluded from the recipe hash.
+calibration:
+  dataset_path: null
+  num_samples: null
+  seq_len: 32768
+  batch_size: 1
