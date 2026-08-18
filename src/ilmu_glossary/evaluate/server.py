@@ -43,6 +43,46 @@ class ServerHandle:
         return f"{self.base_url}/v1/chat/completions"
 
 
+def _clamp_to_model_capacity(model_path: str, requested: int, cfg: Config) -> int:
+    """Clamp the serving context to what the model actually supports.
+
+    vLLM refuses to start when max_model_len exceeds the checkpoint's
+    max_position_embeddings, and the documented override
+    (VLLM_ALLOW_LONG_MAX_MODEL_LEN) risks NaNs under RoPE or out-of-bounds
+    reads under absolute position encoding - not something to enable silently
+    in a measurement pipeline.
+
+    Reading the capacity from the checkpoint keeps one config value working
+    across a 32K proxy and a 1M-context Nemotron.
+    """
+    try:
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=cfg.model.trust_remote_code
+        )
+    except Exception as exc:
+        logger.warning("Could not read %s config (%r); serving at %d", model_path, exc, requested)
+        return requested
+
+    derived = getattr(model_config, "max_position_embeddings", None)
+    if not isinstance(derived, int | float) or derived <= 0:
+        return requested
+
+    capacity = int(derived)
+    if requested <= capacity:
+        return requested
+
+    logger.warning(
+        "Requested max_model_len=%d exceeds the model's %d; serving at %d. "
+        "Evaluation inputs longer than this are truncated, so record it.",
+        requested,
+        capacity,
+        capacity,
+    )
+    return capacity
+
+
 def _wait_for_health(base_url: str, *, timeout_s: int = 1800, interval_s: float = 5.0) -> None:
     """Block until the server answers /health.
 
@@ -91,10 +131,13 @@ def serve(
         except (urllib.error.URLError, OSError, TimeoutError):
             pass
 
+    requested = max_model_len or cfg.model.eval_max_model_len
+    effective = _clamp_to_model_capacity(model_path, requested, cfg)
+
     args = cfg.vllm.serve_args(
         model_path,
         mamba_state=mamba_state,
-        max_model_len=max_model_len or cfg.model.eval_max_model_len,
+        max_model_len=effective,
         # The dry-run proxy is a plain transformer MoE; Mamba/Nemotron flags
         # would make vLLM refuse to start.
         hybrid_mamba=not cfg.dry_run,
