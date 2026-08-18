@@ -21,7 +21,7 @@ from typing import Any
 
 import modal
 
-from modal_app.images import cpu_image, gpu_image
+from modal_app.images import cpu_image, gpu_image, ptq_image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -116,7 +116,7 @@ def phase0_data_prep(config_yaml: str | None = None, dry_run: bool = False) -> d
 
 
 @app.function(
-    image=gpu_image,
+    image=ptq_image,
     gpu="B200",
     volumes=VOLUMES,
     secrets=SECRETS,
@@ -165,7 +165,7 @@ def phase2_calib_select(
 
 
 @app.function(
-    image=gpu_image,
+    image=ptq_image,
     gpu="B200",
     volumes=VOLUMES,
     secrets=SECRETS,

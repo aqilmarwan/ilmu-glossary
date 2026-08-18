@@ -21,6 +21,20 @@ PYTHON_VERSION = "3.12"
 # Blackwell SM100+; the image will build on any host but the kernels only
 # exist on B200/B300/GB200.
 VLLM_VERSION = "0.27.1"
+
+# transformers 5.x FUSES MoE experts into batched 3D parameters - a single
+# Qwen2MoeExperts module carrying gate_up_proj of shape
+# (num_experts, 2*intermediate, hidden) - instead of one nn.Linear per expert.
+# ModelOpt's Linear-targeting configs then skip every routed expert, and PTQ
+# silently produces a checkpoint whose experts are still full precision.
+#
+# Measured on Qwen1.5-MoE-A2.7B, routed-expert nn.Linear modules:
+#   transformers 5.15.0 -> 0
+#   transformers 4.57.1 -> 4320   (24 layers x 60 experts x 3 projections)
+#
+# Serving needs transformers 5.x (vLLM 0.27.1 requires it) while PTQ needs
+# 4.x. Since PTQ never imports vLLM, the two live in separate images.
+PTQ_TRANSFORMERS_VERSION = "4.57.1"
 # vLLM 0.27.1 resolves its own torch; the observed runtime version inside the
 # image is 2.13.0+cu130 regardless of what is requested here, so this pin is
 # a floor rather than an exact match. Recorded because a silent torch swap
@@ -114,12 +128,41 @@ gpu_image = (
 )
 
 
+# --------------------------------------------------------------------------
+# PTQ image - phases 1 and 3. transformers 4.x, ModelOpt, no vLLM.
+# --------------------------------------------------------------------------
+#
+# Phase 1 shares this image so the expert indices it profiles come from the
+# same module layout phase 3 quantizes. Profiling under one layout and
+# quantizing under another would silently misalign every expert id.
+
+ptq_image = (
+    modal.Image.from_registry(
+        f"nvidia/cuda:{CUDA_TAG}-devel-ubuntu22.04",
+        add_python=PYTHON_VERSION,
+    )
+    .apt_install("git", "build-essential")
+    .pip_install(*[d for d in _HOST_DEPS if not d.startswith("transformers")])
+    .pip_install(f"transformers=={PTQ_TRANSFORMERS_VERSION}")
+    .pip_install(
+        f"torch=={TORCH_VERSION}",
+        index_url="https://download.pytorch.org/whl/cu128",
+    )
+    .pip_install(f"nvidia-modelopt=={MODELOPT_VERSION}", "accelerate>=1.2")
+    .env({**_ENV, "TORCH_CUDA_ARCH_LIST": "10.0"})
+    .add_local_python_source("ilmu_glossary", "modal_app")
+    .add_local_dir("recipes", remote_path="/root/recipes")
+)
+
+
 __all__ = [
     "CUDA_TAG",
     "MODELOPT_VERSION",
+    "PTQ_TRANSFORMERS_VERSION",
     "PYTHON_VERSION",
     "TORCH_VERSION",
     "VLLM_VERSION",
     "cpu_image",
     "gpu_image",
+    "ptq_image",
 ]
