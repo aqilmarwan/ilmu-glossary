@@ -122,6 +122,30 @@ def headroom_analysis(kl: pd.DataFrame | None, cfg: Config) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "no tier-1 KL results"}
 
     metric = "bm_en_delta"
+
+    # Headroom must be computed WITHIN a recipe family. The two families
+    # differ by an order of magnitude in absolute damage, so differencing a
+    # W4A16 baseline against a W4A4 oracle would report a headroom that is
+    # really the family gap.
+    if "family" in kl.columns and kl["family"].nunique() > 1:
+        per_family = {
+            str(family): headroom_analysis(group.drop(columns=["family"]), cfg)
+            for family, group in kl.groupby("family")
+        }
+        computed = {f: r for f, r in per_family.items() if r.get("status") == "computed"}
+        if not computed:
+            return {
+                "status": "unavailable",
+                "reason": "no family has both oracle_contaminated and baseline_en",
+                "per_family": per_family,
+            }
+        # Report the family in which the mechanism can operate, if present.
+        preferred = next((f for f in computed if "w4a4" in f), next(iter(computed)))
+        result = dict(computed[preferred])
+        result["family"] = preferred
+        result["per_family"] = per_family
+        return result
+
     oracle = kl[kl["variant"] == CalibVariant.ORACLE_CONTAMINATED.value]
     baseline = kl[kl["variant"] == CalibVariant.BASELINE_EN.value]
 
@@ -136,6 +160,34 @@ def headroom_analysis(kl: pd.DataFrame | None, cfg: Config) -> dict[str, Any]:
     # Recovery is a reduction in the BM-EN delta towards zero.
     absolute = baseline_value - oracle_value
     relative = absolute / abs(baseline_value) if baseline_value else 0.0
+
+    # There is nothing to recover unless the baseline shows a Malay penalty in
+    # the first place. Dividing by a delta that is itself indistinguishable
+    # from zero turns measurement noise into a large percentage: the shipped
+    # W4A16 family produced deltas of -0.00025 and -0.00030, neither
+    # significant, which computed as "20% headroom, gate open".
+    baseline_significant = bool(
+        baseline["delta_excludes_zero"].max() if "delta_excludes_zero" in baseline.columns else True
+    )
+    if not baseline_significant:
+        return {
+            "status": "computed",
+            "metric": metric,
+            "baseline_en": baseline_value,
+            "oracle_contaminated": oracle_value,
+            "absolute_headroom": absolute,
+            "relative_headroom": float("nan"),
+            "threshold": cfg.calibration.gate_min_relative_headroom,
+            "gate_open": False,
+            "baseline_significant": False,
+            "verdict": (
+                "No Malay penalty to recover. The baseline BM-EN delta is not "
+                "distinguishable from zero, so relative headroom is undefined "
+                "and recalibration has nothing to act on. This is the finding, "
+                "not a failure to measure one."
+            ),
+        }
+
     gate_open = relative >= cfg.calibration.gate_min_relative_headroom
 
     return {
@@ -147,6 +199,7 @@ def headroom_analysis(kl: pd.DataFrame | None, cfg: Config) -> dict[str, Any]:
         "relative_headroom": relative,
         "threshold": cfg.calibration.gate_min_relative_headroom,
         "gate_open": gate_open,
+        "baseline_significant": True,
         "verdict": (
             "Headroom exists; recalibration has something to recover."
             if gate_open

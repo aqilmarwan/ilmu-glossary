@@ -1564,3 +1564,67 @@ class TestEnablePatternsMatchBothLayouts:
         assert expert_rules(RecipeFamily.W4A16_SHIPPED, "weight_quantizer")
         assert not expert_rules(RecipeFamily.W4A16_SHIPPED, "input_quantizer")
         assert expert_rules(RecipeFamily.W4A4_MECHANISM, "input_quantizer")
+
+
+class TestHeadroomIsPerFamily:
+    """The two families differ by ~2x in absolute damage, so differencing a
+    W4A16 baseline against a W4A4 oracle reports a 'headroom' that is really
+    the family gap."""
+
+    @staticmethod
+    def _frame() -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "family": "w4a16_shipped",
+                    "variant": "baseline_en",
+                    "bm_en_delta": -0.00025,
+                    "delta_excludes_zero": 0.0,
+                },
+                {
+                    "family": "w4a16_shipped",
+                    "variant": "oracle_contaminated",
+                    "bm_en_delta": -0.00030,
+                },
+                {
+                    "family": "w4a4_mechanism",
+                    "variant": "baseline_en",
+                    "bm_en_delta": 0.01390,
+                    "delta_excludes_zero": 1.0,
+                },
+                {
+                    "family": "w4a4_mechanism",
+                    "variant": "oracle_contaminated",
+                    "bm_en_delta": 0.01102,
+                },
+            ]
+        )
+
+    def test_families_are_not_mixed(self) -> None:
+        from ilmu_glossary.analyze import headroom_analysis
+
+        result = headroom_analysis(self._frame(), Config())
+        assert result["status"] == "computed"
+        assert result["family"] == "w4a4_mechanism"
+        # 20.7% within the W4A4 family, not the cross-family gap.
+        assert result["relative_headroom"] == pytest.approx(0.207, abs=0.01)
+        assert result["gate_open"]
+
+    def test_each_family_reported_separately(self) -> None:
+        from ilmu_glossary.analyze import headroom_analysis
+
+        per = headroom_analysis(self._frame(), Config())["per_family"]
+        assert set(per) == {"w4a16_shipped", "w4a4_mechanism"}
+        assert not per["w4a16_shipped"]["gate_open"]
+
+    def test_insignificant_baseline_yields_no_headroom(self) -> None:
+        """-0.00025 vs -0.00030 is noise, but their ratio is 20%. Dividing by a
+        delta indistinguishable from zero must not manufacture headroom."""
+        from ilmu_glossary.analyze import headroom_analysis
+
+        shipped = self._frame().query("family == 'w4a16_shipped'").drop(columns=["family"])
+        result = headroom_analysis(shipped, Config())
+        assert result["baseline_significant"] is False
+        assert not result["gate_open"]
+        assert np.isnan(result["relative_headroom"])
+        assert "no malay penalty to recover" in result["verdict"].lower()
