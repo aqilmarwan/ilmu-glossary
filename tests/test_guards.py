@@ -1036,3 +1036,52 @@ class TestFusedExpertQuantizerDetection:
                 self.gate_up_proj_input_quantizer = TestFusedExpertQuantizerDetection._Q(True)
 
         assert _weight_quantizers(ActOnly()) == []
+
+
+class TestAiperfParsing:
+    """AIPerf exports metrics as .csv/.json/.jsonl and its key names have
+    shifted between releases. A parser that matches one exact layout falls
+    back silently to the in-process benchmark, which measures differently -
+    so tier 4e would quietly stop being an AIPerf measurement."""
+
+    def test_json_export(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        import json
+
+        from ilmu_glossary.evaluate.throughput import _parse_aiperf_output
+
+        (tmp_path / "profile_export_aiperf.json").write_text(
+            json.dumps(
+                {
+                    "output_token_throughput": {"avg": 4321.5},
+                    "request_throughput": {"avg": 17.2},
+                    "time_to_first_token": {"avg": 91.3, "p99": 180.4},
+                }
+            )
+        )
+        metrics = _parse_aiperf_output(tmp_path)
+        assert metrics is not None
+        assert metrics["output_token_throughput"] == 4321.5
+        assert metrics["time_to_first_token_p99"] == 180.4
+
+    def test_csv_export(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.evaluate.throughput import _parse_aiperf_output
+
+        (tmp_path / "profile_export_aiperf.csv").write_text(
+            "Metric,avg,p99\nOutput Token Throughput,4321.5,\nTime To First Token,91.3,180.4\n"
+        )
+        metrics = _parse_aiperf_output(tmp_path)
+        assert metrics is not None
+        assert metrics["output_token_throughput"] == 4321.5
+
+    def test_raw_records_are_not_mistaken_for_the_summary(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.evaluate.throughput import _parse_aiperf_output
+
+        (tmp_path / "profile_export_aiperf_raw.jsonl").write_text(
+            '{"request_throughput": 1.0}\n{"request_throughput": 2.0}\n'
+        )
+        assert _parse_aiperf_output(tmp_path) is None
+
+    def test_missing_metrics_returns_none(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from ilmu_glossary.evaluate.throughput import _parse_aiperf_output
+
+        assert _parse_aiperf_output(tmp_path) is None

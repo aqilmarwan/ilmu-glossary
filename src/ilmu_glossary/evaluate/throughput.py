@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +72,7 @@ def run_aiperf(
     *,
     concurrency: int,
     checkpoint_label: str,
+    artifact_root: Path,
     n_requests: int | None = None,
 ) -> ThroughputResult | None:
     """Drive one concurrency level through NVIDIA AIPerf."""
@@ -79,42 +80,45 @@ def run_aiperf(
         return None
 
     requests = n_requests or max(concurrency * 8, 32)
-    with tempfile.TemporaryDirectory() as tmp:
-        out_dir = Path(tmp)
-        cmd = [
-            "aiperf",
-            "profile",
-            "--model",
-            handle.model_path,
-            "--url",
-            handle.base_url,
-            "--endpoint-type",
-            "completions",
-            "--concurrency",
-            str(concurrency),
-            "--request-count",
-            str(requests),
-            "--warmup-request-count",
-            str(cfg.eval.throughput_warmup_requests),
-            "--synthetic-input-tokens-mean",
-            str(cfg.eval.throughput_input_tokens),
-            "--output-tokens-mean",
-            str(cfg.eval.throughput_output_tokens),
-            "--streaming",
-            "--artifact-dir",
-            str(out_dir),
-        ]
-        logger.info("AIPerf c=%d: %s", concurrency, " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=3600)
-        except subprocess.CalledProcessError as exc:
-            logger.error("AIPerf failed (c=%d): %s", concurrency, exc.stderr[-2000:])
-            return None
-        except subprocess.TimeoutExpired:
-            logger.error("AIPerf timed out at concurrency %d", concurrency)
-            return None
+    # Persist artifacts rather than using a temp dir: when parsing fails the
+    # only way to find out what AIPerf actually wrote is to look at it, and a
+    # TemporaryDirectory deletes the evidence before anyone can.
+    out_dir = artifact_root / f"{checkpoint_label}_c{concurrency}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "aiperf",
+        "profile",
+        "--model",
+        handle.model_path,
+        "--url",
+        handle.base_url,
+        "--endpoint-type",
+        "completions",
+        "--concurrency",
+        str(concurrency),
+        "--request-count",
+        str(requests),
+        "--warmup-request-count",
+        str(cfg.eval.throughput_warmup_requests),
+        "--synthetic-input-tokens-mean",
+        str(cfg.eval.throughput_input_tokens),
+        "--output-tokens-mean",
+        str(cfg.eval.throughput_output_tokens),
+        "--streaming",
+        "--artifact-dir",
+        str(out_dir),
+    ]
+    logger.info("AIPerf c=%d: %s", concurrency, " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=3600)
+    except subprocess.CalledProcessError as exc:
+        logger.error("AIPerf failed (c=%d): %s", concurrency, exc.stderr[-2000:])
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("AIPerf timed out at concurrency %d", concurrency)
+        return None
 
-        parsed = _parse_aiperf_output(out_dir)
+    parsed = _parse_aiperf_output(out_dir)
 
     if parsed is None:
         return None
@@ -133,23 +137,84 @@ def run_aiperf(
     )
 
 
-def _parse_aiperf_output(artifact_dir: Path) -> dict[str, float] | None:
-    """Pull metrics out of AIPerf's JSON export.
+# AIPerf exports metrics as .csv / .json / .jsonl into --artifact-dir. Key
+# names have shifted between releases, so metrics are matched by substring
+# rather than exact path.
+_THROUGHPUT_KEYS = ("output_token_throughput", "request_throughput", "token_throughput")
 
-    The exact key layout has shifted between AIPerf releases, so the parser
-    walks the structure rather than indexing fixed paths.
-    """
-    candidates = list(artifact_dir.rglob("*.json"))
-    for path in candidates:
+
+def _parse_aiperf_output(artifact_dir: Path) -> dict[str, float] | None:
+    """Pull metrics out of AIPerf's export, whichever format it used."""
+    for path in sorted(artifact_dir.rglob("*.json")) + sorted(artifact_dir.rglob("*.jsonl")):
+        if path.name.endswith("_raw.jsonl"):
+            continue  # per-request records, not the summary
         try:
-            payload = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+            text = path.read_text()
+            payload = json.loads(text if path.suffix == ".json" else text.splitlines()[0])
+        except (json.JSONDecodeError, OSError, IndexError):
             continue
         flat = _flatten_metrics(payload)
-        if "output_token_throughput" in flat or "request_throughput" in flat:
-            return flat
-    logger.warning("Could not locate AIPerf metrics in %s", artifact_dir)
+        if any(any(k in name for k in _THROUGHPUT_KEYS) for name in flat):
+            return _canonicalise(flat)
+
+    for path in sorted(artifact_dir.rglob("*.csv")):
+        flat = _parse_csv_metrics(path)
+        if flat:
+            return _canonicalise(flat)
+
+    found = sorted(p.name for p in artifact_dir.rglob("*") if p.is_file())
+    logger.warning(
+        "Could not locate AIPerf metrics in %s. Files present: %s. The "
+        "artifacts are kept for inspection; extend _THROUGHPUT_KEYS or "
+        "_parse_csv_metrics once the layout is known.",
+        artifact_dir,
+        found or "(none - AIPerf wrote nothing)",
+    )
     return None
+
+
+def _parse_csv_metrics(path: Path) -> dict[str, float]:
+    """AIPerf's CSV export: a Metric column plus statistic columns."""
+    import csv
+
+    out: dict[str, float] = {}
+    try:
+        with path.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                name = (row.get("Metric") or row.get("metric") or "").strip().lower()
+                if not name:
+                    continue
+                slug = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+                for column, value in row.items():
+                    if column is None or column.lower() in {"metric", ""}:
+                        continue
+                    try:
+                        out[f"{slug}_{column.strip().lower()}"] = float(str(value).replace(",", ""))
+                    except (TypeError, ValueError):
+                        continue
+    except OSError:
+        return {}
+    return out
+
+
+def _canonicalise(flat: dict[str, float]) -> dict[str, float]:
+    """Map whatever names AIPerf used onto the ones ThroughputResult reads."""
+    aliases = {
+        "output_token_throughput": ("output_token_throughput", "output_token_throughput_avg"),
+        "request_throughput": ("request_throughput", "request_throughput_avg"),
+        "time_to_first_token_avg": ("time_to_first_token_avg", "time_to_first_token_mean"),
+        "time_to_first_token_p99": ("time_to_first_token_p99",),
+        "inter_token_latency_avg": ("inter_token_latency_avg", "inter_token_latency_mean"),
+    }
+    out = dict(flat)
+    for canonical, candidates in aliases.items():
+        if canonical in out:
+            continue
+        for name, value in flat.items():
+            if any(name.endswith(c) or name == c for c in candidates):
+                out[canonical] = value
+                break
+    return out
 
 
 def _flatten_metrics(payload: Any, prefix: str = "") -> dict[str, float]:
@@ -249,9 +314,16 @@ def run_fallback_benchmark(
 
 def benchmark_checkpoint(cfg: Config, handle: Any, checkpoint_label: str) -> pd.DataFrame:
     """Sweep every configured concurrency level for one served checkpoint."""
+    artifact_root = cfg.paths.resolve("results") / "aiperf"
     rows: list[dict[str, Any]] = []
     for concurrency in cfg.eval.throughput_concurrencies:
-        result = run_aiperf(cfg, handle, concurrency=concurrency, checkpoint_label=checkpoint_label)
+        result = run_aiperf(
+            cfg,
+            handle,
+            concurrency=concurrency,
+            checkpoint_label=checkpoint_label,
+            artifact_root=artifact_root,
+        )
         if result is None:
             logger.warning(
                 "AIPerf unavailable or failed at c=%d; using the in-process "
