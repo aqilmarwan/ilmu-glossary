@@ -115,7 +115,8 @@ def sequence_nlls(
     logprobs = torch.log_softmax(logits[:-1], dim=-1)
     observed = input_ids[0, 1:].to(logprobs.device)
     picked = logprobs.gather(-1, observed.unsqueeze(-1)).squeeze(-1)
-    return (-picked).to("cpu").tolist()
+    nlls: list[float] = (-picked).to("cpu").tolist()
+    return nlls
 
 
 def capture_pairs(
