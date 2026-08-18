@@ -360,9 +360,22 @@ def run_single_quantization(
         contaminated=variant_enum.is_contaminated,
     )
 
+    # Resume only from a checkpoint that is demonstrably valid. Existence of
+    # config.json is not enough: an earlier run may have written a checkpoint
+    # under a different recipe, or one whose routed experts were never
+    # quantized. Reusing either silently produces evaluation numbers about the
+    # wrong artifact.
     if (checkpoint_dir / "config.json").exists():
-        logger.info("%s already quantized; skipping", tag)
-        return {"skipped": True, **run.to_row()}
+        previous = _previous_run(checkpoint_dir)
+        stale = _staleness_reason(previous, recipe)
+        if stale is None:
+            logger.info("%s already quantized under this recipe; skipping", tag)
+            return {"skipped": True, **(previous or run.to_row())}
+        logger.warning(
+            "%s exists but will be rebuilt: %s. Delete it manually if you intended to keep it.",
+            tag,
+            stale,
+        )
 
     with tracking.run(
         cfg,
@@ -543,6 +556,35 @@ def assert_experts_quantized(model: Any, *, family: str) -> tuple[int, int]:
         )
     logger.info("%s: %d/%d routed-expert carriers quantized", family, quantized, carriers)
     return carriers, quantized
+
+
+def _previous_run(checkpoint_dir: Path) -> dict[str, Any] | None:
+    """Read the run record a previous PTQ wrote beside its checkpoint."""
+    path = checkpoint_dir / "quantization_run.json"
+    if not path.exists():
+        return None
+    try:
+        from ilmu_glossary.io import read_json
+
+        return read_json(path)
+    except Exception:
+        return None
+
+
+def _staleness_reason(previous: dict[str, Any] | None, recipe: Recipe) -> str | None:
+    """Why an existing checkpoint must not be reused, or None if it may be."""
+    if previous is None:
+        return "no quantization_run.json beside it, so its provenance is unknown"
+    if previous.get("error"):
+        return f"the previous attempt recorded an error ({previous['error'][:120]})"
+    if previous.get("recipe_hash") != recipe.identity_hash:
+        return (
+            f"it was built under recipe {previous.get('recipe_hash')} but this run "
+            f"uses {recipe.identity_hash}"
+        )
+    if not previous.get("experts_quantized"):
+        return "its routed experts were never quantized, so it cannot test the hypothesis"
+    return None
 
 
 def _inspect_quantized(model: Any) -> tuple[int, list[str]]:
