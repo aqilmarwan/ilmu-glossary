@@ -8,6 +8,16 @@ checkpoints/
 *.bin
 *.safetensors
 
+# run output and working notes - kept local, not published
+FINDINGS.md
+SPEC_DEVIATIONS.md
+mlflow.db
+mlflow.db-journal
+*.sqlite
+*.sqlite3
+COMMIT_LOG_FULL.md
+COMMIT_MESSAGES_FULL.md
+
 # python
 __pycache__/
 *.py[cod]
