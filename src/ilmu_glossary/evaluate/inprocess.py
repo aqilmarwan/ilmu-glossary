@@ -33,6 +33,7 @@ from typing import Any
 
 import numpy as np
 
+from ilmu_glossary import profiling
 from ilmu_glossary.evaluate import kl as kl_mod
 
 logger = logging.getLogger(__name__)
@@ -71,19 +72,20 @@ def capture_topk(
     target = device or str(getattr(model, "device", "cuda"))
     encoded = {k: v.to(target) for k, v in encoded.items()}
 
-    with torch.inference_mode():
+    with torch.inference_mode(), profiling.record("capture_forward"):
         logits = model(**encoded).logits[0]
 
-    # Drop the last position; it predicts a token beyond the sequence.
-    logits = logits[:-1].float()
-    k = min(top_k, logits.shape[-1])
-    logprobs = torch.log_softmax(logits, dim=-1)
-    top = torch.topk(logprobs, k=k, dim=-1)
+    with profiling.record("capture_topk"):
+        # Drop the last position; it predicts a token beyond the sequence.
+        logits = logits[:-1].float()
+        k = min(top_k, logits.shape[-1])
+        logprobs = torch.log_softmax(logits, dim=-1)
+        top = torch.topk(logprobs, k=k, dim=-1)
 
-    return kl_mod.TopKLogprobs(
-        token_ids=top.indices.to("cpu").numpy().astype(np.int32),
-        logprobs=top.values.to("cpu").numpy().astype(np.float32),
-    )
+        return kl_mod.TopKLogprobs(
+            token_ids=top.indices.to("cpu").numpy().astype(np.int32),
+            logprobs=top.values.to("cpu").numpy().astype(np.float32),
+        )
 
 
 def sequence_nlls(
@@ -138,6 +140,10 @@ def capture_pairs(
             captured[f"{pair['id']}::{side}"] = capture_topk(
                 model, tokenizer, text, top_k=top_k, max_tokens=max_tokens
             )
+        # One pair - both sides - is the profiler step here, so a trace covers
+        # matched Malay and English work rather than splitting them across
+        # steps and inviting a comparison between unequal windows.
+        profiling.step()
         if i % 50 == 0 and i:
             logger.info("  %s: captured %d pairs", label, i)
     logger.info("%s: captured %d pair-sides", label, len(captured))

@@ -33,7 +33,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from ilmu_glossary import tracking
+from ilmu_glossary import profiling, tracking
 from ilmu_glossary.config import CalibVariant, Config, RecipeFamily
 from ilmu_glossary.io import read_jsonl, write_json, write_parquet
 from ilmu_glossary.seeds import seed_everything
@@ -287,16 +287,21 @@ def build_forward_loop(
         with torch.inference_mode():
             for start in range(0, len(texts), batch_size):
                 batch = texts[start : start + batch_size]
-                encoded = tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=seq_len,
-                    padding=True,
-                )
-                encoded = {k: v.to(device) for k, v in encoded.items()}
-                model(**encoded, **keep_kwarg)
+                with profiling.record("calib_tokenize"):
+                    encoded = tokenizer(
+                        batch,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=seq_len,
+                        padding=True,
+                    )
+                    encoded = {k: v.to(device) for k, v in encoded.items()}
+                with profiling.record("calib_forward"):
+                    model(**encoded, **keep_kwarg)
                 del encoded
+                # One calibration batch is the natural profiler step: it is
+                # the unit ModelOpt observes activations over.
+                profiling.step()
                 if (start // max(batch_size, 1)) % 32 == 0:
                     logger.info("  calibration %d/%d", start, len(texts))
                     if torch.cuda.is_available():

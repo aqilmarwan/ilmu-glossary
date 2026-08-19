@@ -578,6 +578,49 @@ class TrackingConfig(BaseModel):
     log_artifacts: bool = False  # parquet already persists to the volume
 
 
+class ProfilingConfig(BaseModel):
+    """torch.profiler settings for the GPU phases.
+
+    Instrumentation only: it changes what is *observed*, never what is
+    computed, which is why `Config.fingerprint` excludes it. A trace captured
+    mid-run must not make its artifacts look like they came from different
+    settings.
+
+    The schedule bounds the cost. `repeat=1` records exactly one
+    wait/warmup/active cycle at the start of a region and nothing after, so a
+    12-hour calibration pays for a handful of steps.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    # Its own Volume, not /vol: traces are debugging exhaust, not artifacts,
+    # and a 100 MB trace per run should not enter the results Volume.
+    trace_dir: Path = Path("/traces")
+
+    wait: int = 1
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 1
+
+    # Each of these multiplies trace size. On a 30B model with_stack alone can
+    # turn a 20 MB trace into a gigabyte, so they stay opt-in.
+    record_shapes: bool = False
+    profile_memory: bool = False
+    with_stack: bool = False
+
+    # Rows of the key_averages table to log when a region closes. 0 disables.
+    print_rows: int = 15
+
+    @model_validator(mode="after")
+    def _check_schedule_records_something(self) -> Self:
+        if self.active < 1:
+            raise ValueError("profiling.active must be >= 1 or no step is ever recorded")
+        if self.wait < 0 or self.warmup < 0 or self.repeat < 0:
+            raise ValueError("profiling wait/warmup/repeat must be non-negative")
+        return self
+
+
 # --------------------------------------------------------------------------
 # root config
 # --------------------------------------------------------------------------
@@ -612,6 +655,7 @@ class Config(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     modal: ModalConfig = Field(default_factory=ModalConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
+    profiling: ProfilingConfig = Field(default_factory=ProfilingConfig)
 
     @model_validator(mode="after")
     def _check_gate_is_reachable(self) -> Self:
@@ -660,7 +704,11 @@ class Config(BaseModel):
         fingerprints were not produced by the same settings and must not be
         compared without saying so.
         """
-        payload = self.model_dump(mode="json", exclude={"dry_run"})
+        # `profiling` is excluded for the same reason as `dry_run`: it is
+        # instrumentation, not a setting the results depend on. Including it
+        # would make a profiled run's parquet incomparable to an unprofiled
+        # one that computed exactly the same thing.
+        payload = self.model_dump(mode="json", exclude={"dry_run", "profiling"})
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
@@ -689,6 +737,7 @@ __all__ = [
     "ModalConfig",
     "ModelConfig",
     "PathsConfig",
+    "ProfilingConfig",
     "QuantConfig",
     "RecipeFamily",
     "RecordFormat",

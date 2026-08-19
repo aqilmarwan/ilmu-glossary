@@ -8,6 +8,11 @@ checkpoints/
 *.bin
 *.safetensors
 
+# torch.profiler traces downloaded off the traces Volume
+traces/
+*.pt.trace.json
+*.pt.trace.json.gz
+
 # run output and working notes - kept local, not published
 FINDINGS.md
 SPEC_DEVIATIONS.md

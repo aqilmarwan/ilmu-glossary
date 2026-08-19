@@ -4,7 +4,11 @@
 # through Modal - see `make modal-run`.
 
 CONFIG ?= configs/config.yaml
-MODAL  := modal run modal_app/app.py
+# `uv run`, not a bare `modal`: the image mounts the local `ilmu_glossary`
+# package, so Modal has to be able to import it. A `modal` from another
+# environment - a base conda, say - fails with "ilmu_glossary has no spec".
+MODAL   := uv run modal run modal_app/app.py
+PROFILE := uv run modal run modal_app/profiling.py
 
 .PHONY: help
 help:
@@ -51,6 +55,14 @@ modal-dry: ## End-to-end smoke test on a small MoE, tiny N
 .PHONY: modal-run
 modal-run: preflight ## The staged run on B200 (honours the spec's gates)
 	$(MODAL) --config $(CONFIG)
+
+.PHONY: modal-profile
+modal-profile: ## torch.profiler trace of one PTQ cell, downloaded locally
+	$(PROFILE)::profile_phase --config $(CONFIG)
+
+.PHONY: modal-tensorboard
+modal-tensorboard: ## Serve TensorBoard over the traces Volume
+	uv run modal deploy modal_app/profiling.py
 
 .PHONY: report
 report: ## Regenerate REPORT.md from existing artifacts

@@ -1628,3 +1628,81 @@ class TestHeadroomIsPerFamily:
         assert not result["gate_open"]
         assert np.isnan(result["relative_headroom"])
         assert "no malay penalty to recover" in result["verdict"].lower()
+
+
+# --------------------------------------------------------------------------
+# profiling
+# --------------------------------------------------------------------------
+
+
+class TestProfilingIsInert:
+    """Instrumentation must not change what is computed, or what the artifacts
+    claim was computed. Both failures here are silent."""
+
+    def test_fingerprint_ignores_profiling(self) -> None:
+        """A profiled run writes the same fingerprint as an unprofiled one.
+
+        If it did not, every parquet produced while investigating performance
+        would look like it came from different settings, and the comparability
+        rule would exclude it from the report for no real reason."""
+        plain = Config()
+        profiled = plain.model_copy(
+            update={"profiling": plain.profiling.model_copy(update={"enabled": True})}
+        )
+        assert profiled.profiling.enabled
+        assert profiled.fingerprint() == plain.fingerprint()
+
+    def test_fingerprint_still_tracks_real_settings(self) -> None:
+        """The exclusion is narrow: a genuine setting must still move it."""
+        plain = Config()
+        changed = plain.model_copy(update={"eval": plain.eval.model_copy(update={"kl_top_k": 64})})
+        assert changed.fingerprint() != plain.fingerprint()
+
+    def test_step_and_record_are_noops_when_disabled(self) -> None:
+        """The hot loops call these tens of thousands of times per run, with
+        no profiler open. They must not raise and must not require torch."""
+        from ilmu_glossary import profiling
+
+        assert profiling.active() is None
+        profiling.step()
+        with profiling.record("calib_forward"):
+            pass
+        assert profiling.active() is None
+
+    def test_disabled_config_yields_no_region(self) -> None:
+        from ilmu_glossary import profiling
+
+        cfg = Config()
+        assert not cfg.profiling.enabled
+        with profiling.torch_profile(cfg, "phase3_calibration") as region:
+            assert region is None
+            assert profiling.active() is None
+
+    def test_schedule_must_record_something(self) -> None:
+        """active=0 profiles nothing while looking enabled - the exact shape of
+        a run that costs profiling overhead and produces no trace."""
+        from ilmu_glossary.config import ProfilingConfig
+
+        with pytest.raises(ValueError, match="active"):
+            ProfilingConfig(enabled=True, active=0)
+
+    def test_artifact_writers_never_open_a_profiler(self) -> None:
+        """Structural, because the alternative needs a GPU.
+
+        Phase 3 measures `wall_clock_s` and `peak_memory_gb` around the very
+        code a profiler would instrument, and `fingerprint()` deliberately
+        ignores the profiling section - so an in-band region would write
+        inflated timings carrying a clean-looking fingerprint. Profiling lives
+        in its own job (`profile_run.py`); these modules only carry the
+        zero-cost step/record hooks."""
+        from pathlib import Path
+
+        import ilmu_glossary
+
+        root = Path(ilmu_glossary.__file__).parent
+        for module in ("quantize.py", "quantize_and_eval.py", "analyze.py"):
+            source = (root / module).read_text()
+            assert "torch_profile(" not in source, (
+                f"{module} opens a profiling region; it writes study artifacts "
+                "and must not be instrumented in band"
+            )

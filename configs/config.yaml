@@ -223,3 +223,21 @@ tracking:
   enabled: true
   experiment_name: routing-aware-calibration
   tracking_uri: file:///vol/mlruns
+
+# torch.profiler. Off by default and excluded from the config fingerprint:
+# it changes what is observed, never what is computed. Enable here or pass
+# `--profile` to a GPU phase. The schedule records one wait/warmup/active
+# cycle per region and nothing after, so cost does not scale with run length.
+profiling:
+  enabled: false
+  trace_dir: /traces
+  wait: 1
+  warmup: 1
+  active: 3
+  repeat: 1
+  # Each of these multiplies trace size; with_stack in particular can turn a
+  # 20 MB trace into a gigabyte on a 30B model.
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  print_rows: 15
