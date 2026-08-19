@@ -14,10 +14,10 @@ Target model: **NVIDIA Nemotron 3.5 Lightning 30B-A3B** (hybrid Mamba-2 + MoE
 > Architecture-determined findings transfer; model-quality findings do not.
 > No claim is made about ILMU accuracy.
 
-Read [`SPEC_DEVIATIONS.md`](SPEC_DEVIATIONS.md) before interpreting any
-result. The original spec's stated mechanism rests on precision assignments
-that the shipped checkpoint does not use, which is why two recipe families
-are run rather than one.
+The original spec's stated mechanism rests on precision assignments that the
+shipped checkpoint does not use, which is why two recipe families are run
+rather than one. The deviations from that spec are recorded outside this
+repository; source comments refer to them by id (D1, D2, ...).
 
 ---
 
